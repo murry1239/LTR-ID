@@ -19,6 +19,8 @@ SOURCES = {
     "PubMed": None,
 }
 MANUAL = summarizer.MANUAL_PROVIDER
+CUSTOM_MODEL = "✏️ 직접 입력"
+APP_VERSION = "0.2"
 
 st.set_page_config(page_title="문검기", page_icon="📚", layout="wide")
 
@@ -31,6 +33,40 @@ def _autosave(widget_key: str, apply):
         apply(cfg, value.strip() if isinstance(value, str) else value)
         settings.save(cfg)
     return callback
+
+
+def model_picker(cfg: dict, provider: str, info: dict, api_key: str) -> str:
+    """번역 모델 선택: 불러온 모델 목록(없으면 추천 모델) 중에서 고르거나 직접 입력."""
+    saved = cfg["models"].get(provider, info["default_model"])
+    listed = cfg.get("model_lists", {}).get(provider) or info.get("suggested", [])
+    options = listed + ([saved] if saved and saved not in listed else []) + [CUSTOM_MODEL]
+    k = f"cfg_modelpick_{provider}"
+    choice = st.sidebar.selectbox(
+        "번역 모델", options, index=options.index(saved) if saved in options else 0, key=k,
+        help="‘사용 가능한 모델 불러오기’를 누르면 API 키로 쓸 수 있는 모델이 모두 표시됩니다.",
+        on_change=_autosave(k, lambda c, v, p=provider: v != CUSTOM_MODEL and c["models"].__setitem__(p, v)))
+    if choice == CUSTOM_MODEL:
+        k = f"cfg_model_{provider}"
+        model = st.sidebar.text_input(
+            "모델 이름", value=saved, help=info["model_help"],
+            key=k, on_change=_autosave(k, lambda c, v, p=provider: c["models"].__setitem__(p, v)))
+    else:
+        model = choice
+
+    if info.get("suggested") and st.sidebar.button("🔄 사용 가능한 모델 불러오기", use_container_width=True,
+                                                   disabled=not api_key, key=f"list_{provider}"):
+        with st.sidebar, st.spinner("모델 목록 불러오는 중..."):
+            try:
+                names = summarizer.list_models(provider, api_key)
+            except Exception as e:  # noqa: BLE001
+                st.sidebar.error(f"목록을 불러오지 못했습니다: {summarizer.explain_error(e)}")
+                names = []
+        if names:
+            cfg = settings.load()
+            cfg.setdefault("model_lists", {})[provider] = names
+            settings.save(cfg)
+            st.rerun()
+    return model.strip()
 
 
 def sidebar() -> dict:
@@ -50,7 +86,8 @@ def sidebar() -> dict:
         "AI 선택", names, index=names.index(cfg["provider"]) if cfg["provider"] in names else 0,
         key="cfg_provider", on_change=_autosave("cfg_provider", lambda c, v: c.update(provider=v)))
 
-    opts = {"provider": provider, "mode": mode, "model": "", "api_key": "", "endpoint": "", "chat": ""}
+    opts = {"provider": provider, "mode": mode, "model": "", "api_key": "", "endpoint": "", "chat": "",
+            "fallback": True}
     if provider == MANUAL:
         chats = list(summarizer.CHAT_LIMITS)
         opts["chat"] = st.sidebar.selectbox(
@@ -63,10 +100,6 @@ def sidebar() -> dict:
                                "회사 계정 Copilot이나 ChatGPT를 권장합니다.")
     else:
         info = summarizer.PROVIDERS[provider]
-        k = f"cfg_model_{provider}"
-        opts["model"] = st.sidebar.text_input(
-            "모델", value=cfg["models"].get(provider, info["default_model"]), help=info["model_help"],
-            key=k, on_change=_autosave(k, lambda c, v, p=provider: c["models"].__setitem__(p, v))).strip()
         k = f"cfg_key_{provider}"
         opts["api_key"] = st.sidebar.text_input(
             "API 키", value=cfg["api_keys"].get(provider) or os.environ.get(info["env"], ""), type="password",
@@ -78,6 +111,13 @@ def sidebar() -> dict:
                 placeholder="https://<리소스명>.openai.azure.com/",
                 key="cfg_endpoint",
                 on_change=_autosave("cfg_endpoint", lambda c, v: c.update(azure_endpoint=v))).strip()
+        opts["model"] = model_picker(cfg, provider, info, opts["api_key"])
+        opts["fallback"] = True
+        if info.get("fallbacks"):
+            opts["fallback"] = st.sidebar.checkbox(
+                "선택한 모델이 붐비면 다른 무료 모델로 자동 전환", value=cfg.get("fallback", True),
+                help=" → ".join(info["fallbacks"]) + " 순서로 시도합니다.",
+                key="cfg_fallback", on_change=_autosave("cfg_fallback", lambda c, v: c.update(fallback=v)))
         if provider == summarizer.FREE_PROVIDER:
             st.sidebar.caption("Google 계정으로 https://aistudio.google.com/apikey 에서 무료 API 키를 받으세요. "
                                "무료 한도(분당 약 10회) 때문에 번역은 천천히 진행됩니다.")
@@ -87,7 +127,8 @@ def sidebar() -> dict:
             st.sidebar.caption("⚠️ 저장된 API 키가 없습니다.")
         if st.sidebar.button("연결 테스트", use_container_width=True):
             with st.sidebar, st.spinner("AI에 시험 요청 중..."):
-                ok, msg = summarizer.test_connection(provider, opts["model"], opts["api_key"], opts["endpoint"])
+                ok, msg = summarizer.test_connection(provider, opts["model"], opts["api_key"], opts["endpoint"],
+                                                     fallback=opts["fallback"])
             (st.sidebar.success if ok else st.sidebar.error)(msg)
 
     st.sidebar.subheader("저장 위치")
@@ -245,6 +286,7 @@ def source_tab(site: str, module, opts: dict):
             bar = st.progress(0.0, text=f"AI {label} 중...")
             errors, used_models = summarizer.summarize(
                 articles, provider, opts["model"], opts["api_key"], opts["endpoint"], mode=mode,
+                fallback=opts["fallback"],
                 progress=lambda d, t: bar.progress(d / t, text=f"AI {label} 중 {d}/{t}"))
             bar.empty()
             if errors:
@@ -267,7 +309,7 @@ def source_tab(site: str, module, opts: dict):
                 excel.unique_path(folder, filename), articles,
                 search_name=name or result["terms"][0], site=site, query=result["query"],
                 year_from=result["year_from"], year_to=result["year_to"], today=result["today"],
-                ai_note=ai_note, abstract_header=header)
+                ai_note=f"[문검기 v{APP_VERSION}] {ai_note}", abstract_header=header)
         except PermissionError:
             st.error("파일을 저장할 수 없습니다. 같은 이름의 엑셀 파일이 열려 있으면 닫고 다시 시도하세요.")
             return
@@ -285,7 +327,7 @@ def source_tab(site: str, module, opts: dict):
 
 
 def main():
-    st.title("📚 문검기 (문헌검색기)")
+    st.title(f"📚 문검기 (문헌검색기) v{APP_VERSION}")
     st.caption("검색어와 기간을 입력해 문헌을 검색하고, 결과를 확인한 뒤 엑셀 파일로 정리합니다.")
     opts = sidebar()
     tabs = st.tabs(list(SOURCES))

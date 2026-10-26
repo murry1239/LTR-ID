@@ -24,6 +24,7 @@ PROVIDERS = {
         "default_model": "gemini-3.5-flash",
         # 입력한 모델이 과부하(503)·시간초과·서비스 종료면 차례로 시도
         "fallbacks": ["gemini-flash-latest", "gemini-flash-lite-latest"],
+        "suggested": ["gemini-3.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest"],
         "model_help": "무료 키: https://aistudio.google.com/apikey · 과부하 시 gemini-flash-latest → "
                       "gemini-flash-lite-latest 순으로 자동 전환",
         "batch": 8, "workers": 1, "interval": 7.0,
@@ -31,11 +32,13 @@ PROVIDERS = {
     "Claude (Anthropic)": {
         "env": "ANTHROPIC_API_KEY",
         "default_model": "claude-opus-5-5",
+        "suggested": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
         "model_help": "예: claude-opus-5-5 (기본), claude-sonnet-5-5, claude-haiku-5-5 (저렴)",
     },
     "ChatGPT (OpenAI)": {
         "env": "OPENAI_API_KEY",
         "default_model": "gpt-5",
+        "suggested": ["gpt-5", "gpt-5-mini"],
         "model_help": "OpenAI 계정에서 쓸 수 있는 모델명 (예: gpt-5, gpt-5-mini)",
     },
     "Azure OpenAI (유료, 회사 계약 시)": {
@@ -164,6 +167,35 @@ def _call_gemini(model, api_key, user, system, **_):
     return resp.text or ""
 
 
+_SKIP_WORDS = ("tts", "image", "audio", "live", "embed", "realtime", "transcribe", "search", "robotics",
+               "computer-use", "moderation", "dall-e", "whisper", "veo", "imagen", "lyria", "aqa", "banana")
+
+
+def list_models(provider: str, api_key: str) -> list[str]:
+    """API 키로 쓸 수 있는 텍스트 생성 모델 목록 (최신·별칭 먼저)."""
+    if provider == FREE_PROVIDER:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=30_000))
+        names = [m.name.removeprefix("models/") for m in client.models.list()
+                 if "generateContent" in (m.supported_actions or [])]
+        names = [n for n in names if n.startswith(("gemini", "gemma"))]
+    elif provider == "Claude (Anthropic)":
+        import anthropic
+        names = [m.id for m in anthropic.Anthropic(api_key=api_key).models.list()]
+    elif provider == "ChatGPT (OpenAI)":
+        from openai import OpenAI
+        names = [m.id for m in OpenAI(api_key=api_key).models.list() if m.id.startswith(("gpt-", "o"))]
+    else:
+        return []
+    names = [n for n in names if not any(w in n.lower() for w in _SKIP_WORDS)]
+
+    def order(name: str):
+        nums = [int(x) for x in re.findall(r"\d+", name)[:3]]
+        return (not name.endswith("latest"), "preview" in name or "exp" in name, [-x for x in nums], name)
+    return sorted(dict.fromkeys(names), key=order)
+
+
 CALLERS = {
     "Claude (Anthropic)": _call_claude,
     "ChatGPT (OpenAI)": _call_openai,
@@ -206,15 +238,15 @@ def _retry_delay(text: str) -> float:
     return min(float(m.group(1)) + 2, 90) if m else 30
 
 
-def _models_to_try(provider: str, model: str) -> list[str]:
-    models = [model] + PROVIDERS[provider].get("fallbacks", [])
+def _models_to_try(provider: str, model: str, fallback: bool = True) -> list[str]:
+    models = [model] + (PROVIDERS[provider].get("fallbacks", []) if fallback else [])
     return list(dict.fromkeys(m for m in models if m))
 
 
-def _summarize_batch(provider, model, api_key, batch, endpoint, mode=TRANSLATE) -> tuple[dict, str]:
+def _summarize_batch(provider, model, api_key, batch, endpoint, mode=TRANSLATE, fallback=True) -> tuple[dict, str]:
     """(논문 ID별 결과, 실제로 쓴 모델)을 돌려준다."""
     call = CALLERS[provider]
-    models = _models_to_try(provider, model)
+    models = _models_to_try(provider, model, fallback)
     last_error = None
     for round_ in range(2):  # 모든 모델이 과부하면 잠시 쉬고 한 바퀴 더
         for m in models:
@@ -267,14 +299,15 @@ def explain_error(e: Exception) -> str:
     return f"{hint}\n\n(원문: {text[:300]})"
 
 
-def test_connection(provider: str, model: str, api_key: str, endpoint: str = "") -> tuple[bool, str]:
+def test_connection(provider: str, model: str, api_key: str, endpoint: str = "",
+                    fallback: bool = True) -> tuple[bool, str]:
     """짧은 시험 요청으로 모델명·API 키가 맞는지 확인한다."""
     if not model or not api_key:
         return False, "모델과 API 키를 입력하세요."
     sample = Article(source="test", source_id="1", title="Pioglitazone in type 2 diabetes", authors=[],
                      journal="", bib="", abstract="Pioglitazone improved HbA1c in 100 patients.")
     try:
-        result, used = _summarize_batch(provider, model, api_key, [sample], endpoint)
+        result, used = _summarize_batch(provider, model, api_key, [sample], endpoint, fallback=fallback)
     except Exception as e:  # noqa: BLE001 - 어떤 오류든 화면에 그대로 보여 준다
         return False, f"연결 실패: {explain_error(e)}"
     title = result.get("1", {}).get("titleKo", "")
@@ -283,7 +316,8 @@ def test_connection(provider: str, model: str, api_key: str, endpoint: str = "")
 
 
 def summarize(articles: list[Article], provider: str, model: str, api_key: str,
-              endpoint: str = "", progress=None, mode: str = TRANSLATE) -> tuple[list[str], list[str]]:
+              endpoint: str = "", progress=None, mode: str = TRANSLATE,
+              fallback: bool = True) -> tuple[list[str], list[str]]:
     """articles의 title_ko / study_type / abstract_ko를 채운다. (오류·확인 필요 메시지, 실제로 쓴 모델) 반환.
 
     1차로 묶어서 요청한 뒤, 결과 검사에 걸린 논문(빈칸, 초록이 있는데 '초록 확인 안됨', 일본어·한자 섞임,
@@ -296,7 +330,8 @@ def summarize(articles: list[Article], provider: str, model: str, api_key: str,
     def run(batches, done_offset):
         done = done_offset
         with ThreadPoolExecutor(max_workers=PROVIDERS[provider].get("workers", 4)) as pool:
-            futures = {pool.submit(_summarize_batch, provider, model, api_key, b, endpoint, mode): b for b in batches}
+            futures = {pool.submit(_summarize_batch, provider, model, api_key, b, endpoint, mode, fallback): b
+                       for b in batches}
             for fut in as_completed(futures):
                 batch = futures[fut]
                 try:

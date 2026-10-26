@@ -9,18 +9,18 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core import excel, koreamed, settings, summarizer
+from core import excel, koreamed, riss, settings, summarizer
 
 # 사이트 추가 순서: KoreaMed → RISS → 국회도서관 → PubMed
 SOURCES = {
     "KoreaMed": koreamed,
-    "RISS": None,
+    "RISS": riss,
     "국회도서관": None,
     "PubMed": None,
 }
 MANUAL = summarizer.MANUAL_PROVIDER
 CUSTOM_MODEL = "✏️ 직접 입력"
-APP_VERSION = "0.3"
+APP_VERSION = "0.4"
 
 st.set_page_config(page_title="문검기", page_icon="📚", layout="wide")
 
@@ -205,77 +205,103 @@ def manual_panel(key: str, result: dict, opts: dict) -> bool:
     return False
 
 
+def _split_terms(text: str) -> list[str]:
+    return [t.strip() for t in (text or "").split(",") if t.strip()]
+
+
+def _show_group(site: str, group: dict, articles: list, shown_mode):
+    st.markdown(f"#### 🔎 {', '.join(group['terms'])}")
+    st.caption(f"검색식: {group['query']}")
+    if not articles:
+        st.info("검색 결과 0건 — 엑셀에는 검색 조건과 0건 결과가 기록됩니다.")
+        return
+    years = pd.Series([a.year for a in articles]).value_counts().sort_index()
+    m1, m2, m3 = st.columns(3)
+    m1.metric("검색 결과", f"{len(articles)}건")
+    m2.metric("초록 있음", f"{sum(a.has_abstract for a in articles)}건")
+    m3.metric("초록 없음", f"{sum(not a.has_abstract for a in articles)}건")
+    st.caption("연도별: " + " · ".join(f"{int(y)}년 {c}건" for y, c in years.items() if pd.notna(y)))
+    show_table(results_table(articles, shown_mode), site)
+
+
 def source_tab(site: str, module, opts: dict):
     key = f"{site}_"
     st.subheader(f"{site} 검색")
+    second_label = getattr(module, "SECOND_QUERY_LABEL", None)
+    first_label = getattr(module, "FIRST_QUERY_LABEL", "검색어 (제품명·성분명)")
 
-    c1, c2, c3 = st.columns([3, 1, 1])
-    terms_text = c1.text_input("검색어 (제품명·성분명)", key=key + "terms",
-                               placeholder="예: pioglitazone   ·  동의어는 쉼표로 구분: thioctic acid, lipoic acid")
+    cols = st.columns([3, 3, 1, 1]) if second_label else st.columns([3, 1, 1])
+    terms_text = cols[0].text_input(
+        first_label, key=key + "terms",
+        placeholder=("예: 피오글리타존  ·  동의어는 쉼표로: 티옥트산, 치옥트산" if second_label else
+                     "예: pioglitazone   ·  동의어는 쉼표로 구분: thioctic acid, lipoic acid"))
+    second_text = cols[1].text_input(second_label, key=key + "terms2",
+                                     placeholder="예: pioglitazone") if second_label else ""
     this_year = date.today().year
-    year_from = c2.number_input("시작연도", 1950, this_year, 2021, key=key + "y1")
-    year_to = c3.number_input("종료연도", 1950, this_year + 1, this_year, key=key + "y2")
+    year_from = cols[-2].number_input("시작연도", 1950, this_year, 2021, key=key + "y1")
+    year_to = cols[-1].number_input("종료연도", 1950, this_year + 1, this_year, key=key + "y2")
+    if second_label:
+        st.caption("한글 검색어와 영문 검색어를 함께 넣으면 한 번에 검색하고, 엑셀은 검색어별로 따로 만듭니다.")
 
     if st.button("🔍 검색", key=key + "search", type="primary"):
-        terms = [t.strip() for t in terms_text.split(",") if t.strip()]
-        if not terms:
+        term_groups = [g for g in (_split_terms(terms_text), _split_terms(second_text)) if g]
+        if not term_groups:
             st.warning("검색어를 입력하세요.")
         elif year_from > year_to:
             st.warning("시작연도가 종료연도보다 늦습니다.")
         else:
-            bar = st.progress(0.0, text="검색 중...")
-            try:
-                query, articles = module.search(
-                    terms, int(year_from), int(year_to),
-                    progress=lambda d, t: bar.progress(min(d / max(t, 1), 1.0), text=f"결과 가져오는 중 {d}/{t}"))
-            except Exception as e:  # noqa: BLE001
+            groups, pool = [], {}
+            for terms in term_groups:
+                label = f"[{', '.join(terms)}] 검색 중"
+                bar = st.progress(0.0, text=label + "...")
+                try:
+                    query, found = module.search(
+                        terms, int(year_from), int(year_to),
+                        progress=lambda d, t, lb=label: bar.progress(min(d / max(t, 1), 1.0), text=f"{lb} {d}/{t}"))
+                except Exception as e:  # noqa: BLE001
+                    bar.empty()
+                    st.error(f"검색 중 오류가 발생했습니다: {type(e).__name__} {e}")
+                    return
                 bar.empty()
-                st.error(f"검색 중 오류가 발생했습니다: {e}")
-                return
-            bar.empty()
+                for a in found:  # 한글·영문 검색에 같은 논문이 나오면 한 번만 번역하도록 공유
+                    pool.setdefault(a.source_id, a)
+                groups.append({"terms": terms, "query": query, "ids": [a.source_id for a in found]})
             st.session_state[key + "result"] = {
-                "terms": terms, "query": query, "articles": articles,
+                "groups": groups, "pool": pool, "articles": list(pool.values()),
                 "year_from": int(year_from), "year_to": int(year_to),
-                "today": date.today(), "ai_mode": None, "saved": None,
+                "today": date.today(), "ai_mode": None, "saved": [],
             }
 
     result = st.session_state.get(key + "result")
     if not result:
         return
 
-    articles = result["articles"]
-    st.markdown(f"**검색식:** `{result['query']}`  ·  **검색일:** {result['today']:%Y-%m-%d}")
-    if not articles:
-        st.info("검색 결과가 없습니다.")
-        return
-
-    years = pd.Series([a.year for a in articles]).value_counts().sort_index()
-    m1, m2, m3 = st.columns(3)
-    m1.metric("검색 결과", f"{len(articles)}건")
-    m2.metric("초록 있음", f"{sum(a.has_abstract for a in articles)}건")
-    m3.metric("초록 없음", f"{sum(not a.has_abstract for a in articles)}건")
-    st.caption("연도별: " + " · ".join(f"{int(y)}년 {c}건" for y, c in years.items()))
-
+    articles, pool = result["articles"], result["pool"]
     mode, provider = opts["mode"], opts["provider"]
     manual = provider == MANUAL
     shown_mode = result["ai_mode"] or (mode if manual and result.get("manual_done") else None)
-    show_table(results_table(articles, shown_mode), site)
+    st.caption(f"검색일: {result['today']:%Y-%m-%d}")
+    for group in result["groups"]:
+        _show_group(site, group, [pool[i] for i in group["ids"]], shown_mode)
 
     st.divider()
     st.subheader("📄 엑셀 파일 만들기")
-    use_ai = st.checkbox(f"AI {summarizer.MODES[mode]} 포함 ({summarizer.label(provider)})", value=True, key=key + "ai")
+    use_ai = bool(articles) and st.checkbox(f"AI {summarizer.MODES[mode]} 포함 ({summarizer.label(provider)})",
+                                            value=True, key=key + "ai")
     manual_ready = True
     if use_ai and manual:
         manual_ready = manual_panel(key, result, opts)
         st.divider()
 
-    e1, e2 = st.columns([2, 2])
-    name = e1.text_input("파일명에 쓸 검색어명", value=result["terms"][0], key=key + "name")
-    subfolder = e2.text_input("하위 폴더 (선택, 예: 그리타존정(피오글리타존))", key=key + "sub")
-    filename = excel.make_filename(name or result["terms"][0], result["year_from"], result["year_to"],
-                                   module.FILE_TAG, result["today"])
+    subfolder = st.text_input("하위 폴더 (선택, 예: 그리타존정(피오글리타존))", key=key + "sub")
     folder = Path(opts["output_dir"]) / subfolder if subfolder else Path(opts["output_dir"])
-    st.caption(f"저장 위치: {folder / filename}")
+    names = []
+    for i, group in enumerate(result["groups"]):
+        name = st.text_input(f"파일명에 쓸 검색어명 ({', '.join(group['terms'])})", value=group["terms"][0],
+                             key=f"{key}name_{i}") or group["terms"][0]
+        names.append(name)
+        filename = excel.make_filename(name, result["year_from"], result["year_to"], module.FILE_TAG, result["today"])
+        st.caption(f"저장 위치: {folder / filename}")
     if use_ai and manual and not manual_ready:
         st.caption("※ 복사·붙여넣기를 다 마치지 않고 저장하면, 남은 논문의 한글 칸은 비어 있습니다.")
 
@@ -306,25 +332,30 @@ def source_tab(site: str, module, opts: dict):
             header = summarizer.ABSTRACT_HEADERS[result["ai_mode"]]
         else:
             ai_note, header = "AI 번역 없음 (원문만 수록).", summarizer.ABSTRACT_HEADERS[mode]
-        try:
-            path = excel.write_workbook(
-                excel.unique_path(folder, filename), articles,
-                search_name=name or result["terms"][0], site=site, query=result["query"],
-                year_from=result["year_from"], year_to=result["year_to"], today=result["today"],
-                ai_note=f"[문검기 v{APP_VERSION}] {ai_note}", abstract_header=header)
-        except PermissionError:
-            st.error("파일을 저장할 수 없습니다. 같은 이름의 엑셀 파일이 열려 있으면 닫고 다시 시도하세요.")
-            return
-        result["saved"] = str(path)
+        saved = []
+        for group, name in zip(result["groups"], names):
+            filename = excel.make_filename(name, result["year_from"], result["year_to"],
+                                           module.FILE_TAG, result["today"])
+            try:
+                saved.append(str(excel.write_workbook(
+                    excel.unique_path(folder, filename), [pool[i] for i in group["ids"]],
+                    search_name=name, site=site, query=group["query"],
+                    year_from=result["year_from"], year_to=result["year_to"], today=result["today"],
+                    ai_note=f"[문검기 v{APP_VERSION}] {ai_note}", abstract_header=header)))
+            except PermissionError:
+                st.error(f"{filename} 파일을 저장할 수 없습니다. 같은 이름의 엑셀 파일이 열려 있으면 닫고 다시 시도하세요.")
+                return
+        result["saved"] = saved
         st.rerun()
 
-    if result.get("saved"):
-        path = Path(result["saved"])
+    for n, saved in enumerate(result.get("saved") or []):
+        path = Path(saved)
         st.success(f"저장 완료: {path}")
         d1, d2 = st.columns([1, 1])
         if path.exists():
-            d1.download_button("⬇️ 엑셀 내려받기", path.read_bytes(), file_name=path.name, key=key + "dl")
-        if d2.button("📂 폴더 열기", key=key + "open"):
+            d1.download_button(f"⬇️ {path.name} 내려받기", path.read_bytes(), file_name=path.name,
+                               key=f"{key}dl_{n}")
+        if n == 0 and d2.button("📂 폴더 열기", key=key + "open"):
             os.startfile(path.parent)
 
 

@@ -1,4 +1,4 @@
-# 문검기 (문헌검색기) v0.3
+# 문검기 (문헌검색기) v0.4
 
 검색어와 검색기간을 입력 → 검색 결과 확인 → AI 한글 번역 → 엑셀 저장.
 
@@ -43,11 +43,21 @@
 
 ## 사용 순서
 1. 왼쪽 **설정**에서 AI 작업·AI·API 키·번역 모델·저장 폴더 입력 — 입력하면 자동 저장, **연결 테스트**로 확인
-2. 사이트 탭(현재 KoreaMed)에서 검색어·시작연도·종료연도 입력 → **검색**
+2. 사이트 탭(KoreaMed · RISS)에서 검색어·시작연도·종료연도 입력 → **검색**
    - 동의어는 쉼표로 구분 (예: `thioctic acid, lipoic acid, alpha-lipoic acid`) → OR 검색
 3. 결과 표 확인 후 **엑셀 만들기**
-   - 파일명: `검색어명(시작-종료)_Koreamed_검색일자.xlsx`
+   - 파일명: `검색어명(시작-종료)_사이트_검색일자.xlsx` (예: `pioglitazone(2021-2026)_Koreamed_20261026.xlsx`)
    - 하위 폴더(예: `그리타존정(피오글리타존)`)를 적으면 그 폴더에 저장
+
+### 사이트별 검색 조건
+| 사이트 | 검색 조건 | 비고 |
+|---|---|---|
+| KoreaMed | `검색어[ALL] AND 시작:종료[DPY]` | 출판 월·학술지 약어 포함 |
+| RISS | 상세검색 → **국내학술논문**, 분류 **[전체]**, 발행연도 범위 | **한글 검색어 + 영문 검색어**를 함께 넣으면 한 번에 검색하고 엑셀은 검색어별로 따로 저장 (예: `피오글리타존(2021-2026)_RISS_…xlsx`, `pioglitazone(2021-2026)_RISS_…xlsx`). 0건이어도 검색 조건을 기록한 파일을 만듭니다. |
+
+- RISS 목록에는 출판 월·쪽수·DOI가 없어 상세 페이지에서 저자·쪽수·DOI를 가져오고,
+  DOI로 **PubMed → Crossref** 순서로 출판 월·학술지 약어를 보완합니다. 두 곳 모두 정보가 없는 국내 학술지는 출판 월이 빈칸입니다.
+- RISS 저자명: PubMed에 있으면 `Tseng CH` 형식, 없으면 RISS에 적힌 이름 그대로 (예: `전예린`, `Ofri Mosenzon`).
 
 ## 엑셀 구성
 - **문헌정리**: 번호, 출판연도, 출판월, 논문명(원문), 논문명(한글), 서지정보
@@ -56,11 +66,14 @@
 
 ## 구조 (사이트 추가 시)
 - `core/models.py` 공통 논문 형식 · `core/excel.py` 엑셀 · `core/summarizer.py` AI 번역·요약
-- `core/koreamed.py` KoreaMed 검색 — RISS·국회도서관·PubMed도 같은 형태(`search()`, `NAME`, `FILE_TAG`)로 추가 후
+- `core/koreamed.py` KoreaMed 검색, `core/riss.py` RISS 검색, `core/enrich.py` DOI로 서지정보 보완(PubMed·Crossref)
+- 국회도서관·PubMed도 같은 형태(`search()`, `NAME`, `FILE_TAG`, 선택: `SECOND_QUERY_LABEL`)로 추가 후
   `app.py`의 `SOURCES`에 등록하면 탭이 활성화됩니다.
 - `settings.json`(API 키 포함)은 이 PC에만 저장되며 깃허브에 올라가지 않습니다 (`.gitignore`).
 
 ## 변경 이력
+- **v0.4** — RISS 검색 추가 (국내학술논문·[전체]·발행연도, 한글/영문 검색어 동시 검색 → 검색어별 엑셀),
+  DOI로 PubMed·Crossref에서 출판 월·학술지 약어 보완, 사이트 탭에 검색어 2개(한글·영문) 지원
 - **v0.3** — AI 선택을 무료(Gemini API·웹 채팅)/유료(ChatGPT·Claude·Gemini API)로 구분, 유료 Gemini 추가, 기본값 Gemini 무료, 키 발급 링크 표시, README에 구글 API 키 받는 방법 추가 (Azure OpenAI 항목 제거)
 - **v0.2** — 번역 AI 모델 선택 (API 키로 사용 가능한 모델 목록 불러오기, 직접 입력), Gemini 자동 전환 켜기/끄기,
   화면·엑셀에 버전 표시

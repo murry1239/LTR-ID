@@ -1,0 +1,8 @@
+streamlit
+requests
+lxml
+openpyxl
+pandas
+anthropic
+openai
+google-genai

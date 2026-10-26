@@ -1,8 +1,7 @@
 """AI 한글 번역·요약 (논문명 한글 · 연구유형 · 초록 한글 번역 또는 요약).
 
-지원: Gemini(Google, 무료 티어), Claude(Anthropic), ChatGPT(OpenAI), Azure OpenAI — 모두 API 방식.
-웹 채팅(ChatGPT·Gemini·Copilot) 무료 사용은 복사·붙여넣기 모드로 지원.
-Gemini는 Google AI Studio에서 무료 API 키를 받아 쓸 수 있다 (분당·일일 요청 한도 있음).
+무료: Gemini API 무료 티어(Google AI Studio 키), 웹 채팅(ChatGPT·Gemini·Copilot) 복사·붙여넣기.
+유료: ChatGPT(OpenAI), Claude(Anthropic), Gemini(Google) API — 각 회사에서 결제 설정한 API 키 필요.
 Microsoft Copilot은 무료 공개 API가 없어 복사·붙여넣기 모드로만 쓴다.
 """
 import json
@@ -15,39 +14,59 @@ from .models import Article
 
 NO_ABSTRACT = "초록 확인 안됨"
 FREE_PROVIDER = "Gemini (Google) - 무료"
+PAID_GEMINI = "Gemini (Google) - 유료"
 MANUAL_PROVIDER = "웹 채팅 복사·붙여넣기 (ChatGPT·Copilot·Gemini 무료)"
+MANUAL_LABEL = "🆓 무료 · 웹 채팅 복사·붙여넣기 (ChatGPT·Gemini·Copilot)"
 
-# batch: 한 번에 요약할 논문 수 / workers: 동시 요청 수 / interval: 요청 사이 최소 간격(초)
+# 키(이름)는 settings.json에 저장되므로 바꾸지 말 것. 화면에는 label을 보여 준다.
+# family: 호출 방식 / batch: 한 번에 보낼 논문 수 / workers: 동시 요청 수 / interval: 요청 사이 최소 간격(초)
 PROVIDERS = {
     FREE_PROVIDER: {
+        "label": "🆓 무료 · Gemini API (Google AI Studio)",
+        "family": "gemini",
         "env": "GEMINI_API_KEY",
+        "key_url": "https://aistudio.google.com/api-keys",
         "default_model": "gemini-3.5-flash",
         # 입력한 모델이 과부하(503)·시간초과·서비스 종료면 차례로 시도
         "fallbacks": ["gemini-flash-latest", "gemini-flash-lite-latest"],
         "suggested": ["gemini-3.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest"],
-        "model_help": "무료 키: https://aistudio.google.com/apikey · 과부하 시 gemini-flash-latest → "
-                      "gemini-flash-lite-latest 순으로 자동 전환",
+        "model_help": "과부하 시 gemini-flash-latest → gemini-flash-lite-latest 순으로 자동 전환",
         "batch": 8, "workers": 1, "interval": 7.0,
     },
-    "Claude (Anthropic)": {
-        "env": "ANTHROPIC_API_KEY",
-        "default_model": "claude-opus-5-5",
-        "suggested": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
-        "model_help": "예: claude-opus-5-5 (기본), claude-sonnet-5-5, claude-haiku-5-5 (저렴)",
-    },
     "ChatGPT (OpenAI)": {
+        "label": "💳 유료 · ChatGPT (OpenAI API)",
+        "family": "openai",
         "env": "OPENAI_API_KEY",
+        "key_url": "https://platform.openai.com/api-keys",
         "default_model": "gpt-5",
         "suggested": ["gpt-5", "gpt-5-mini"],
-        "model_help": "OpenAI 계정에서 쓸 수 있는 모델명 (예: gpt-5, gpt-5-mini)",
+        "model_help": "OpenAI 계정에서 쓸 수 있는 모델명 (‘사용 가능한 모델 불러오기’로 확인)",
     },
-    "Azure OpenAI (유료, 회사 계약 시)": {
-        "env": "AZURE_OPENAI_API_KEY",
-        "default_model": "",
-        "model_help": "Azure 포털의 배포(deployment) 이름",
-        "needs_endpoint": True,
+    "Claude (Anthropic)": {
+        "label": "💳 유료 · Claude (Anthropic API)",
+        "family": "claude",
+        "env": "ANTHROPIC_API_KEY",
+        "key_url": "https://console.anthropic.com/settings/keys",
+        "default_model": "claude-opus-5-5",
+        "suggested": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"],
+        "model_help": "claude-opus-5-5 (최고 품질), claude-sonnet-5-5, claude-haiku-5-5 (저렴)",
+    },
+    PAID_GEMINI: {
+        "label": "💳 유료 · Gemini (Google API, 결제 설정한 키)",
+        "family": "gemini",
+        "env": "GEMINI_API_KEY",
+        "key_url": "https://aistudio.google.com/api-keys",
+        "default_model": "gemini-pro-latest",
+        "fallbacks": ["gemini-flash-latest"],
+        "suggested": ["gemini-pro-latest", "gemini-flash-latest", "gemini-flash-lite-latest"],
+        "model_help": "결제(Billing)를 설정한 Google AI Studio 프로젝트의 키 사용",
     },
 }
+
+
+def label(provider: str) -> str:
+    return MANUAL_LABEL if provider == MANUAL_PROVIDER else PROVIDERS[provider]["label"]
+
 
 TRANSLATE, SUMMARY = "translate", "summary"
 MODES = {TRANSLATE: "초록 한글 번역 (전체)", SUMMARY: "초록 한글 요약"}
@@ -145,16 +164,6 @@ def _call_openai(model, api_key, user, system, **_):
     return resp.choices[0].message.content or ""
 
 
-def _call_azure(model, api_key, user, system, endpoint="", **_):
-    from openai import AzureOpenAI
-    client = AzureOpenAI(api_key=api_key, azure_endpoint=endpoint, api_version="2024-10-21", max_retries=4)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-    )
-    return resp.choices[0].message.content or ""
-
-
 def _call_gemini(model, api_key, user, system, **_):
     from google import genai
     from google.genai import types
@@ -173,17 +182,18 @@ _SKIP_WORDS = ("tts", "image", "audio", "live", "embed", "realtime", "transcribe
 
 def list_models(provider: str, api_key: str) -> list[str]:
     """API 키로 쓸 수 있는 텍스트 생성 모델 목록 (최신·별칭 먼저)."""
-    if provider == FREE_PROVIDER:
+    family = PROVIDERS[provider]["family"]
+    if family == "gemini":
         from google import genai
         from google.genai import types
         client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=30_000))
         names = [m.name.removeprefix("models/") for m in client.models.list()
                  if "generateContent" in (m.supported_actions or [])]
         names = [n for n in names if n.startswith(("gemini", "gemma"))]
-    elif provider == "Claude (Anthropic)":
+    elif family == "claude":
         import anthropic
         names = [m.id for m in anthropic.Anthropic(api_key=api_key).models.list()]
-    elif provider == "ChatGPT (OpenAI)":
+    elif family == "openai":
         from openai import OpenAI
         names = [m.id for m in OpenAI(api_key=api_key).models.list() if m.id.startswith(("gpt-", "o"))]
     else:
@@ -197,10 +207,9 @@ def list_models(provider: str, api_key: str) -> list[str]:
 
 
 CALLERS = {
-    "Claude (Anthropic)": _call_claude,
-    "ChatGPT (OpenAI)": _call_openai,
-    FREE_PROVIDER: _call_gemini,
-    "Azure OpenAI (유료, 회사 계약 시)": _call_azure,
+    "claude": _call_claude,
+    "openai": _call_openai,
+    "gemini": _call_gemini,
 }
 
 
@@ -245,7 +254,7 @@ def _models_to_try(provider: str, model: str, fallback: bool = True) -> list[str
 
 def _summarize_batch(provider, model, api_key, batch, endpoint, mode=TRANSLATE, fallback=True) -> tuple[dict, str]:
     """(논문 ID별 결과, 실제로 쓴 모델)을 돌려준다."""
-    call = CALLERS[provider]
+    call = CALLERS[PROVIDERS[provider]["family"]]
     models = _models_to_try(provider, model, fallback)
     last_error = None
     for round_ in range(2):  # 모든 모델이 과부하면 잠시 쉬고 한 바퀴 더

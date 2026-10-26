@@ -20,7 +20,7 @@ SOURCES = {
 }
 MANUAL = summarizer.MANUAL_PROVIDER
 CUSTOM_MODEL = "✏️ 직접 입력"
-APP_VERSION = "0.2"
+APP_VERSION = "0.3"
 
 st.set_page_config(page_title="문검기", page_icon="📚", layout="wide")
 
@@ -81,9 +81,11 @@ def sidebar() -> dict:
         index=modes.index(cfg.get("mode", summarizer.TRANSLATE)),
         key="cfg_mode", on_change=_autosave("cfg_mode", lambda c, v: c.update(mode=v)))
 
+    # 기본값: Gemini 무료 (목록 첫 번째)
     names = [summarizer.FREE_PROVIDER, MANUAL] + [p for p in summarizer.PROVIDERS if p != summarizer.FREE_PROVIDER]
     provider = st.sidebar.selectbox(
         "AI 선택", names, index=names.index(cfg["provider"]) if cfg["provider"] in names else 0,
+        format_func=summarizer.label, help="🆓 무료 2가지, 💳 유료 API 3가지 (ChatGPT·Claude·Gemini)",
         key="cfg_provider", on_change=_autosave("cfg_provider", lambda c, v: c.update(provider=v)))
 
     opts = {"provider": provider, "mode": mode, "model": "", "api_key": "", "endpoint": "", "chat": "",
@@ -100,34 +102,34 @@ def sidebar() -> dict:
                                "회사 계정 Copilot이나 ChatGPT를 권장합니다.")
     else:
         info = summarizer.PROVIDERS[provider]
+        saved_key = cfg["api_keys"].get(provider)
+        if not saved_key and provider == summarizer.PAID_GEMINI:  # 무료로 쓰던 키에 결제를 붙인 경우가 많음
+            saved_key = cfg["api_keys"].get(summarizer.FREE_PROVIDER)
         k = f"cfg_key_{provider}"
         opts["api_key"] = st.sidebar.text_input(
-            "API 키", value=cfg["api_keys"].get(provider) or os.environ.get(info["env"], ""), type="password",
+            "API 키", value=saved_key or os.environ.get(info["env"], ""), type="password",
             help="입력 후 Enter 키를 누르면 저장됩니다. (암호화 없이 이 PC에만 저장)",
             key=k, on_change=_autosave(k, lambda c, v, p=provider: c["api_keys"].__setitem__(p, v))).strip()
-        if info.get("needs_endpoint"):
-            opts["endpoint"] = st.sidebar.text_input(
-                "Azure 엔드포인트", value=cfg.get("azure_endpoint", ""),
-                placeholder="https://<리소스명>.openai.azure.com/",
-                key="cfg_endpoint",
-                on_change=_autosave("cfg_endpoint", lambda c, v: c.update(azure_endpoint=v))).strip()
+        st.sidebar.caption(f"API 키 발급: {info['key_url']}")
         opts["model"] = model_picker(cfg, provider, info, opts["api_key"])
         opts["fallback"] = True
         if info.get("fallbacks"):
             opts["fallback"] = st.sidebar.checkbox(
-                "선택한 모델이 붐비면 다른 무료 모델로 자동 전환", value=cfg.get("fallback", True),
+                "선택한 모델이 붐비면 다른 모델로 자동 전환", value=cfg.get("fallback", True),
                 help=" → ".join(info["fallbacks"]) + " 순서로 시도합니다.",
                 key="cfg_fallback", on_change=_autosave("cfg_fallback", lambda c, v: c.update(fallback=v)))
         if provider == summarizer.FREE_PROVIDER:
-            st.sidebar.caption("Google 계정으로 https://aistudio.google.com/apikey 에서 무료 API 키를 받으세요. "
-                               "무료 한도(분당 약 10회) 때문에 번역은 천천히 진행됩니다.")
-        if settings.load()["api_keys"].get(provider):
+            st.sidebar.caption("무료 한도(분당 약 10회) 때문에 번역은 천천히 진행됩니다.")
+        else:
+            st.sidebar.caption("💳 유료 API는 사용량만큼 요금이 나갑니다. (ChatGPT Plus·Claude Pro·Gemini Advanced "
+                               "같은 채팅 구독과는 별개로, 각 회사 API 결제 설정이 필요합니다)")
+        if settings.load()["api_keys"].get(provider) or (saved_key and opts["api_key"] == saved_key):
             st.sidebar.caption(f"✅ 이 PC에 저장된 API 키가 있습니다.")
         elif not os.environ.get(info["env"]):
             st.sidebar.caption("⚠️ 저장된 API 키가 없습니다.")
         if st.sidebar.button("연결 테스트", use_container_width=True):
             with st.sidebar, st.spinner("AI에 시험 요청 중..."):
-                ok, msg = summarizer.test_connection(provider, opts["model"], opts["api_key"], opts["endpoint"],
+                ok, msg = summarizer.test_connection(provider, opts["model"], opts["api_key"],
                                                      fallback=opts["fallback"])
             (st.sidebar.success if ok else st.sidebar.error)(msg)
 
@@ -261,7 +263,7 @@ def source_tab(site: str, module, opts: dict):
 
     st.divider()
     st.subheader("📄 엑셀 파일 만들기")
-    use_ai = st.checkbox(f"AI {summarizer.MODES[mode]} 포함 ({provider})", value=True, key=key + "ai")
+    use_ai = st.checkbox(f"AI {summarizer.MODES[mode]} 포함 ({summarizer.label(provider)})", value=True, key=key + "ai")
     manual_ready = True
     if use_ai and manual:
         manual_ready = manual_panel(key, result, opts)
@@ -292,7 +294,7 @@ def source_tab(site: str, module, opts: dict):
             if errors:
                 st.warning("일부 논문 처리에 실패했습니다 (해당 칸은 비어 있음):\n\n" + "\n".join(f"- {e}" for e in errors))
             result["ai_mode"] = mode
-            result["ai_name"] = f"{provider} · {', '.join(used_models) or opts['model']}"
+            result["ai_name"] = f"{summarizer.label(provider)} · {', '.join(used_models) or opts['model']}"
         elif use_ai and manual and result.get("manual_done"):
             result["ai_mode"] = mode
             result["ai_name"] = f"웹 채팅 · {opts['chat']}"

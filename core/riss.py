@@ -6,13 +6,17 @@
 """
 import html
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
 from .enrich import clean_doi, crossref_by_doi, pubmed_by_doi
+from .log import get_logger
 from .models import Article
+
+log = get_logger()
 
 NAME = "RISS"
 FILE_TAG = "RISS"
@@ -76,9 +80,14 @@ def _parse_list(page_html: str) -> tuple[int, list[dict]]:
 
 
 def _search_term(term, year_from, year_to, session) -> list[dict]:
-    res = session.get(SEARCH_URL, params=_params(term, year_from, year_to, 1), timeout=TIMEOUT)
-    res.raise_for_status()
-    total, items = _parse_list(res.text)
+    for attempt in range(2):  # 0건이면 일시적인 빈 응답일 수 있어 한 번 더 확인
+        res = session.get(SEARCH_URL, params=_params(term, year_from, year_to, 1), timeout=TIMEOUT)
+        res.raise_for_status()
+        total, items = _parse_list(res.text)
+        if total or "검색결과" in res.text:
+            break
+        log.warning("RISS 응답에 검색 결과 영역이 없음 — 다시 요청: %s", term)
+        time.sleep(2)
     for page in range(2, -(-total // PAGE_SIZE) + 1):
         res = session.get(SEARCH_URL, params=_params(term, year_from, year_to, page), timeout=TIMEOUT)
         res.raise_for_status()
@@ -102,7 +111,8 @@ def _detail(item: dict, session) -> dict:
         if key == "저자":
             authors = [_one_line(a) for a in re.findall(r"<a\b[^>]*>(.*?)</a>", value, re.S) if _one_line(a)]
     link = re.search(r"https://www\.riss\.kr/link\?id=(A\d+)", page)
-    return {"fields": fields, "authors": authors,
+    abstracts = [_plain(a) for a in re.findall(r'<div class="textWrap" id="abs\d+">(.*?)</div>', page, re.S)]
+    return {"fields": fields, "authors": authors, "abstracts": [a for a in abstracts if a],
             "riss_id": link.group(1) if link else item["control_no"],
             "link": link.group(0) if link else item["url"]}
 
@@ -123,6 +133,12 @@ def _build(item: dict, detail: dict, meta: dict) -> Article:
     pages = re.sub(r"\(.*?\)", "", f.get("수록면", "")).strip()
     year = item["year"] or (int(f["발행연도"]) if f.get("발행연도", "").isdigit() else None)
     authors = [n for n in (_riss_name(a) for a in detail["authors"]) if n]
+    abstract = item["abstract"]
+    # 목록의 초록은 2,000자에서 잘리므로, 잘렸거나 비어 있으면 상세 페이지의 전체 초록을 쓴다
+    if len(abstract) >= 1990 or not abstract:
+        full = detail.get("abstracts") or []
+        same = [a for a in full if abstract and a[:60] == abstract[:60]]
+        abstract = (same or full or [abstract])[0] if (same or full) else abstract
     month = None
 
     if meta:
@@ -145,7 +161,7 @@ def _build(item: dict, detail: dict, meta: dict) -> Article:
     return Article(
         source=NAME, source_id=detail["riss_id"], title=item["title"], authors=authors, journal=journal,
         bib=bib + ".", year=year, month=month, doi=clean_doi(f.get("DOI식별코드", "")),
-        abstract=item["abstract"], keywords=f.get("주제어", ""), url=detail["link"],
+        abstract=abstract, keywords=f.get("주제어", ""), url=detail["link"],
         extra={"publisher": f.get("발행기관", ""), "language": f.get("작성언어", ""),
                "indexing": f.get("등재정보", ""), "pmid": (meta or {}).get("pmid", "")},
     )
@@ -187,3 +203,30 @@ def search(terms: list[str], year_from: int, year_to: int, progress=None) -> tup
 
     articles = [_build(it, d, meta.get(doi, {})) for it, d, doi in zip(items_list, details, dois)]
     return build_query(terms, year_from, year_to), articles
+
+
+def find_by_title(title: str, year: int | None, session: requests.Session, min_score: float = 0.88):
+    """다른 사이트(국회도서관 등)의 논문 제목으로 RISS에서 같은 논문을 찾는다. 없으면 None.
+
+    '한글 제목 = English title' 처럼 병기된 경우 각 부분으로 검색해 본다.
+    """
+    from .enrich import title_similarity
+    parts = [p.strip() for p in re.split(r"\s+=\s+", title or "") if p.strip()] or [title]
+    y1, y2 = (year - 1, year + 1) if year else (1900, 2100)
+    for part in parts:
+        words = re.sub(r"[^\w\s\-]", " ", part).split()[:12]
+        if len(words) < 2:
+            continue
+        res = session.get(SEARCH_URL, params=_params(" ".join(words), y1, y2, 1), timeout=TIMEOUT)
+        res.raise_for_status()
+        _, items = _parse_list(res.text)  # 첫 쪽(최대 100건)만 비교
+        scored = sorted(((title_similarity(title, it["title"]), it) for it in items), key=lambda x: -x[0])
+        if scored and scored[0][0] >= min_score:
+            item = scored[0][1]
+            detail = _detail(item, session)
+            doi = clean_doi(detail["fields"].get("DOI식별코드", ""))
+            meta = pubmed_by_doi([doi], session).get(doi, {}) if doi else {}
+            if doi and not meta:
+                meta = crossref_by_doi(doi, session)
+            return _build(item, detail, meta)
+    return None

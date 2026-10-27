@@ -74,14 +74,15 @@ def write_workbook(path: Path, articles: list[Article], *, search_name: str, sit
         cell.font = font or Font(name=FONT, size=10, color="475569")
 
     titles = ["번호", "출판연도", "출판월", "논문명 (원문)", "논문명 (한글)", "서지정보",
-              abstract_header, "연구유형", "DOI", f"{site} ID", "출처"]
-    widths = [6, 9, 7, 50, 36, 42, 80, 14, 26, 12, 11]
+              abstract_header, "연구유형", "DOI", f"{site} ID", "출처", "비고"]
+    widths = [6, 9, 7, 50, 36, 42, 80, 14, 26, 16, 11, 36]
     head = 6
     _header(ws, head, titles, widths)
     for n, a in enumerate(articles, 1):
         r = head + n
         values = [n, a.year, a.month, a.title, a.title_ko, a.citation, a.abstract_ko, a.study_type,
-                  a.doi, a.source_id, site]
+                  a.doi, a.source_id, site,
+                  " ".join(x for x in (a.extra.get("note", ""), a.extra.get("matched_url", "")) if x)]
         for col, v in enumerate(values, 1):
             cell = ws.cell(row=r, column=col, value=v)
             _body_cell(cell)

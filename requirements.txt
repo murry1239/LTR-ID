@@ -6,3 +6,4 @@ pandas
 anthropic
 openai
 google-genai
+xlrd

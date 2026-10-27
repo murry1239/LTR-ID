@@ -9,18 +9,24 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core import excel, koreamed, riss, settings, summarizer
+import time
+
+from core import excel, koreamed, nanet, riss, settings, summarizer
+from core.log import LOG_DIR, get_logger, tail
+
+log = get_logger()
 
 # 사이트 추가 순서: KoreaMed → RISS → 국회도서관 → PubMed
 SOURCES = {
     "KoreaMed": koreamed,
     "RISS": riss,
-    "국회도서관": None,
+    "국회도서관": nanet,
     "PubMed": None,
 }
 MANUAL = summarizer.MANUAL_PROVIDER
 CUSTOM_MODEL = "✏️ 직접 입력"
-APP_VERSION = "0.4"
+APP_VERSION = "0.5"
+LOG_HINT = "\n\n🧾 자세한 내용은 왼쪽 아래 ‘로그 보기’에서 확인하세요."
 
 st.set_page_config(page_title="문검기", page_icon="📚", layout="wide")
 
@@ -58,8 +64,10 @@ def model_picker(cfg: dict, provider: str, info: dict, api_key: str) -> str:
         with st.sidebar, st.spinner("모델 목록 불러오는 중..."):
             try:
                 names = summarizer.list_models(provider, api_key)
+                log.info("모델 목록 불러오기 (%s): %d개", provider, len(names))
             except Exception as e:  # noqa: BLE001
-                st.sidebar.error(f"목록을 불러오지 못했습니다: {summarizer.explain_error(e)}")
+                log.exception("모델 목록 불러오기 실패 (%s)", provider)
+                st.sidebar.error(f"목록을 불러오지 못했습니다: {summarizer.explain_error(e)}{LOG_HINT}")
                 names = []
         if names:
             cfg = settings.load()
@@ -194,7 +202,9 @@ def manual_panel(key: str, result: dict, opts: dict) -> bool:
     if st.button("✅ 답변 반영", key=f"{key}apply_{mode}_{i}"):
         try:
             filled, missing = summarizer.apply_manual_answer(batch, answer)
+            log.info("웹 채팅 답변 반영: %d번째 묶음, %d건 반영, 누락 %s", i + 1, filled, missing or "없음")
         except Exception as e:  # noqa: BLE001 - 형식이 깨진 답변
+            log.warning("웹 채팅 답변 읽기 실패 (%d번째 묶음): %s / 답변 앞부분: %r", i + 1, e, answer[:200])
             st.error(f"답변을 읽지 못했습니다. AI 답변 전체(대괄호 [ ] 포함)를 붙여 넣었는지 확인하세요. ({e})")
             return False
         if missing:
@@ -224,12 +234,10 @@ def _show_group(site: str, group: dict, articles: list, shown_mode):
     show_table(results_table(articles, shown_mode), site)
 
 
-def source_tab(site: str, module, opts: dict):
-    key = f"{site}_"
-    st.subheader(f"{site} 검색")
+def _search_inputs(key: str, module):
+    """검색어 입력 화면 → (실행할 작업 목록, 시작연도, 종료연도, 버튼 눌림)."""
     second_label = getattr(module, "SECOND_QUERY_LABEL", None)
     first_label = getattr(module, "FIRST_QUERY_LABEL", "검색어 (제품명·성분명)")
-
     cols = st.columns([3, 3, 1, 1]) if second_label else st.columns([3, 1, 1])
     terms_text = cols[0].text_input(
         first_label, key=key + "terms",
@@ -238,37 +246,76 @@ def source_tab(site: str, module, opts: dict):
     second_text = cols[1].text_input(second_label, key=key + "terms2",
                                      placeholder="예: pioglitazone") if second_label else ""
     this_year = date.today().year
-    year_from = cols[-2].number_input("시작연도", 1950, this_year, 2021, key=key + "y1")
-    year_to = cols[-1].number_input("종료연도", 1950, this_year + 1, this_year, key=key + "y2")
+    year_from = int(cols[-2].number_input("시작연도", 1950, this_year, 2021, key=key + "y1"))
+    year_to = int(cols[-1].number_input("종료연도", 1950, this_year + 1, this_year, key=key + "y2"))
     if second_label:
         st.caption("한글 검색어와 영문 검색어를 함께 넣으면 한 번에 검색하고, 엑셀은 검색어별로 따로 만듭니다.")
+    clicked = st.button("🔍 검색", key=key + "search", type="primary")
+    jobs = [(terms, lambda progress, t=terms: module.search(t, year_from, year_to, progress=progress))
+            for terms in (_split_terms(terms_text), _split_terms(second_text)) if terms]
+    return jobs, year_from, year_to, clicked
 
-    if st.button("🔍 검색", key=key + "search", type="primary"):
-        term_groups = [g for g in (_split_terms(terms_text), _split_terms(second_text)) if g]
-        if not term_groups:
-            st.warning("검색어를 입력하세요.")
+
+def _upload_inputs(key: str, module):
+    """결과 파일 올리기 화면 (국회도서관처럼 직접 검색이 막힌 사이트)."""
+    st.markdown(module.GUIDE)
+    this_year = date.today().year
+    slots = []
+    for col, label, n, example in zip(st.columns(2), (module.FIRST_QUERY_LABEL, module.SECOND_QUERY_LABEL),
+                                      ("1", "2"), ("메트포르민", "metformin")):
+        with col:
+            name = st.text_input(f"{label} (파일명에 사용)", key=f"{key}uname{n}", placeholder=f"예: {example}")
+            file = st.file_uploader(f"{label} 검색결과 파일 (.xls)", type=["xls", "xlsx"], key=f"{key}file{n}")
+            slots.append((name.strip(), file))
+    y1, y2, _ = st.columns([1, 1, 4])
+    year_from = int(y1.number_input("시작연도", 1950, this_year, 2021, key=key + "y1"))
+    year_to = int(y2.number_input("종료연도", 1950, this_year + 1, this_year, key=key + "y2"))
+    st.caption("파일의 논문을 제목으로 RISS·PubMed에서 찾아 저자·학술지·초록을 채웁니다 (100건에 1~2분).")
+    clicked = st.button("📥 불러와서 정리", key=key + "search", type="primary")
+    jobs = []
+    for name, file in slots:
+        if file is None:
+            continue
+        data, filename = file.getvalue(), file.name
+        jobs.append(([name or Path(filename).stem],
+                     lambda progress, d=data, f=filename: module.load(d, f, year_from, year_to, progress=progress)))
+    return jobs, year_from, year_to, clicked
+
+
+def source_tab(site: str, module, opts: dict):
+    key = f"{site}_"
+    upload = getattr(module, "UPLOAD", False)
+    st.subheader(f"{site} {'검색결과 정리' if upload else '검색'}")
+    jobs, year_from, year_to, clicked = (_upload_inputs if upload else _search_inputs)(key, module)
+
+    if clicked:
+        if not jobs:
+            st.warning("검색결과 파일을 올리세요." if upload else "검색어를 입력하세요.")
         elif year_from > year_to:
             st.warning("시작연도가 종료연도보다 늦습니다.")
         else:
             groups, pool = [], {}
-            for terms in term_groups:
-                label = f"[{', '.join(terms)}] 검색 중"
+            for terms, run in jobs:
+                label = f"[{', '.join(terms)}] {'정리' if upload else '검색'} 중"
                 bar = st.progress(0.0, text=label + "...")
+                log.info("[%s] %s 시작: %s, %d–%d", site, "파일 정리" if upload else "검색", terms, year_from, year_to)
+                started = time.monotonic()
                 try:
-                    query, found = module.search(
-                        terms, int(year_from), int(year_to),
-                        progress=lambda d, t, lb=label: bar.progress(min(d / max(t, 1), 1.0), text=f"{lb} {d}/{t}"))
+                    query, found = run(lambda d, t, lb=label: bar.progress(min(d / max(t, 1), 1.0), text=f"{lb} {d}/{t}"))
                 except Exception as e:  # noqa: BLE001
                     bar.empty()
-                    st.error(f"검색 중 오류가 발생했습니다: {type(e).__name__} {e}")
+                    log.exception("[%s] 실패: %s", site, terms)
+                    st.error(f"{'파일 정리' if upload else '검색'} 중 오류가 발생했습니다: {type(e).__name__} {e}{LOG_HINT}")
                     return
                 bar.empty()
+                log.info("[%s] 완료: %s → %d건 (%.0f초) · %s", site, terms, len(found),
+                         time.monotonic() - started, query)
                 for a in found:  # 한글·영문 검색에 같은 논문이 나오면 한 번만 번역하도록 공유
                     pool.setdefault(a.source_id, a)
                 groups.append({"terms": terms, "query": query, "ids": [a.source_id for a in found]})
             st.session_state[key + "result"] = {
                 "groups": groups, "pool": pool, "articles": list(pool.values()),
-                "year_from": int(year_from), "year_to": int(year_to),
+                "year_from": year_from, "year_to": year_to,
                 "today": date.today(), "ai_mode": None, "saved": [],
             }
 
@@ -308,6 +355,7 @@ def source_tab(site: str, module, opts: dict):
     if st.button("💾 엑셀 만들기", key=key + "make", type="primary"):
         if use_ai and not manual and result["ai_mode"] != mode:
             if not opts["api_key"] or not opts["model"]:
+                log.warning("엑셀 만들기 중단: AI 모델 또는 API 키 없음 (%s)", provider)
                 st.error("왼쪽 설정에서 AI 모델과 API 키를 입력하세요. (AI 없이 저장하려면 체크를 해제)")
                 return
             label = summarizer.MODES[mode]
@@ -318,7 +366,8 @@ def source_tab(site: str, module, opts: dict):
                 progress=lambda d, t: bar.progress(d / t, text=f"AI {label} 중 {d}/{t}"))
             bar.empty()
             if errors:
-                st.warning("일부 논문 처리에 실패했습니다 (해당 칸은 비어 있음):\n\n" + "\n".join(f"- {e}" for e in errors))
+                st.warning("일부 논문 처리에 실패했습니다 (해당 칸은 비어 있음):\n\n" +
+                           "\n".join(f"- {e}" for e in errors) + LOG_HINT)
             result["ai_mode"] = mode
             result["ai_name"] = f"{summarizer.label(provider)} · {', '.join(used_models) or opts['model']}"
         elif use_ai and manual and result.get("manual_done"):
@@ -343,8 +392,14 @@ def source_tab(site: str, module, opts: dict):
                     year_from=result["year_from"], year_to=result["year_to"], today=result["today"],
                     ai_note=f"[문검기 v{APP_VERSION}] {ai_note}", abstract_header=header)))
             except PermissionError:
+                log.exception("엑셀 저장 실패 (파일이 열려 있거나 권한 없음): %s", folder / filename)
                 st.error(f"{filename} 파일을 저장할 수 없습니다. 같은 이름의 엑셀 파일이 열려 있으면 닫고 다시 시도하세요.")
                 return
+            except Exception as e:  # noqa: BLE001
+                log.exception("엑셀 저장 실패: %s", folder / filename)
+                st.error(f"{filename} 저장 중 오류: {type(e).__name__} {e}{LOG_HINT}")
+                return
+            log.info("[%s] 엑셀 저장: %s (%d건)", site, saved[-1], len(group["ids"]))
         result["saved"] = saved
         st.rerun()
 
@@ -359,10 +414,24 @@ def source_tab(site: str, module, opts: dict):
             os.startfile(path.parent)
 
 
+@st.dialog("🧾 작업 기록 (로그)", width="large")
+def log_dialog():
+    st.caption(f"최근 300줄 · 파일: {LOG_DIR / 'munkeomgi.log'} · API 키는 가려서 기록합니다.")
+    text = tail(300)
+    st.code(text, language=None, height=480)
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇️ 로그 파일 내려받기", text.encode("utf-8"), file_name="munkeomgi_log.txt")
+    if c2.button("📂 로그 폴더 열기"):
+        os.startfile(LOG_DIR)
+
+
 def main():
     st.title(f"📚 문검기 (문헌검색기) v{APP_VERSION}")
     st.caption("검색어와 기간을 입력해 문헌을 검색하고, 결과를 확인한 뒤 엑셀 파일로 정리합니다.")
     opts = sidebar()
+    st.sidebar.divider()
+    if st.sidebar.button("🧾 로그 보기", use_container_width=True, help="오류가 나면 여기서 어느 단계에서 났는지 확인할 수 있습니다."):
+        log_dialog()
     tabs = st.tabs(list(SOURCES))
     for tab, (site, module) in zip(tabs, SOURCES.items()):
         with tab:
@@ -372,4 +441,10 @@ def main():
                 source_tab(site, module, opts)
 
 
-main()
+try:
+    main()
+except Exception as e:  # noqa: BLE001 - 예상하지 못한 오류도 로그에 남기고 화면에 안내
+    if type(e).__name__ in ("RerunException", "StopException"):  # Streamlit 내부 흐름 제어
+        raise
+    log.exception("예상하지 못한 오류")
+    st.error(f"예상하지 못한 오류가 발생했습니다: {type(e).__name__} {e}{LOG_HINT}")

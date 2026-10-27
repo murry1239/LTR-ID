@@ -4,11 +4,16 @@
 동의어 여러 개는 OR로 묶는다: ("thioctic acid"[ALL] OR "lipoic acid"[ALL]) AND 2021:2026[DPY]
 """
 import re
+import time
 
 import requests
 from lxml import html
 
+from .log import get_logger
 from .models import MONTHS, Article
+
+log = get_logger()
+RETRIES = 3  # KoreaMed가 가끔 빈 응답을 주므로 잠시 쉬고 다시 요청
 
 NAME = "KoreaMed"
 FILE_TAG = "Koreamed"
@@ -28,12 +33,24 @@ def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def count(query: str, session: requests.Session) -> int:
+def _count_once(query: str, session: requests.Session) -> int:
     res = session.get(URL, params={"QY": query}, timeout=TIMEOUT)
     res.raise_for_status()
     root = html.fromstring(res.content)
     value = root.xpath('//input[@name="s_totalRecord"]/@value')
     return int(value[0]) if value and value[0].strip() else 0
+
+
+def count(query: str, session: requests.Session) -> int:
+    """0건이면 일시적인 빈 응답일 수 있어 몇 번 더 확인한다."""
+    for attempt in range(RETRIES):
+        total = _count_once(query, session)
+        if total:
+            return total
+        if attempt < RETRIES - 1:
+            log.warning("KoreaMed 0건 응답 — %d초 후 다시 확인 (%d/%d): %s", 2 * (attempt + 1), attempt + 1, RETRIES, query)
+            time.sleep(2 * (attempt + 1))
+    return 0
 
 
 def _fetch_page(query: str, total: int, page: int, session: requests.Session) -> list[Article]:
@@ -129,7 +146,13 @@ def search(terms: list[str], year_from: int, year_to: int, progress=None) -> tup
         last_page = -(-total // PAGE_SIZE)
         page = 1
         while page <= last_page:
-            batch = _fetch_page(query, total, page, session)
+            batch = []
+            for attempt in range(RETRIES):
+                batch = _fetch_page(query, total, page, session)
+                if batch:
+                    break
+                log.warning("KoreaMed 결과 %d쪽 빈 응답 — 다시 요청 (%d/%d)", page, attempt + 1, RETRIES)
+                time.sleep(2 * (attempt + 1))
             if not batch:
                 break
             for a in batch:
@@ -137,4 +160,7 @@ def search(terms: list[str], year_from: int, year_to: int, progress=None) -> tup
             if progress:
                 progress(len(articles), total)
             page += 1
+    if len(articles) < total:
+        log.error("KoreaMed 결과 일부만 받음: %d/%d건 (%s)", len(articles), total, query)
+        raise RuntimeError(f"KoreaMed 응답이 불완전합니다 ({len(articles)}/{total}건). 잠시 후 다시 검색하세요.")
     return query, list(articles.values())

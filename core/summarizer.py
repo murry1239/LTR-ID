@@ -10,7 +10,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from .log import get_logger
 from .models import Article
+
+log = get_logger()
 
 NO_ABSTRACT = "초록 확인 안됨"
 FREE_PROVIDER = "Gemini (Google) - 무료"
@@ -31,7 +34,7 @@ PROVIDERS = {
         "fallbacks": ["gemini-flash-latest", "gemini-flash-lite-latest"],
         "suggested": ["gemini-3.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest"],
         "model_help": "과부하 시 gemini-flash-latest → gemini-flash-lite-latest 순으로 자동 전환",
-        "batch": 8, "workers": 1, "interval": 7.0,
+        "batch": 10, "workers": 1, "interval": 7.0,
     },
     "ChatGPT (OpenAI)": {
         "label": "💳 유료 · ChatGPT (OpenAI API)",
@@ -252,10 +255,28 @@ def _models_to_try(provider: str, model: str, fallback: bool = True) -> list[str
     return list(dict.fromkeys(m for m in models if m))
 
 
+_exhausted: dict[str, float] = {}  # 하루 한도를 다 쓴 모델 → 소진 시각 (3시간 동안 건너뜀)
+_exhausted_lock = threading.Lock()
+
+
+def _is_exhausted(model: str) -> bool:
+    with _exhausted_lock:
+        at = _exhausted.get(model)
+        return at is not None and time.time() - at < 3 * 3600
+
+
+def _is_daily_quota(text: str) -> bool:
+    """무료 티어 하루 요청 한도 초과 (결제 잔액 부족과는 구분)."""
+    low = text.lower()
+    return _is_rate_limit(text) and ("perday" in low or "per day" in low)
+
+
 def _summarize_batch(provider, model, api_key, batch, endpoint, mode=TRANSLATE, fallback=True) -> tuple[dict, str]:
     """(논문 ID별 결과, 실제로 쓴 모델)을 돌려준다."""
     call = CALLERS[PROVIDERS[provider]["family"]]
-    models = _models_to_try(provider, model, fallback)
+    models = [m for m in _models_to_try(provider, model, fallback) if not _is_exhausted(m)]
+    if not models:
+        raise SummaryError("429 RESOURCE_EXHAUSTED — 시도할 수 있는 모든 모델이 오늘 무료 한도(requests per day)를 다 썼습니다.")
     last_error = None
     for round_ in range(2):  # 모든 모델이 과부하면 잠시 쉬고 한 바퀴 더
         for m in models:
@@ -269,15 +290,27 @@ def _summarize_batch(provider, model, api_key, batch, endpoint, mode=TRANSLATE, 
                 except (SummaryError, json.JSONDecodeError) as e:
                     last_error = e
                     format_tries += 1
+                    log.warning("AI 응답 형식 오류 (%s, 논문 %s 외 %d건) — 다시 요청: %s",
+                                m, batch[0].source_id, len(batch) - 1, e)
                 except Exception as e:  # noqa: BLE001 - 오류 종류에 따라 대기·모델 전환·중단
                     text = str(e)
                     last_error = e
                     if _is_unavailable(text):
+                        log.warning("AI 모델 사용 불가 (%s) — 다음 모델로 전환: %s", m, text[:300])
                         break  # 다음 모델로
+                    if _is_daily_quota(text):  # 모델마다 하루 한도가 따로 있으므로 다음 모델로
+                        with _exhausted_lock:
+                            _exhausted[m] = time.time()
+                        log.warning("AI 모델 오늘 한도 소진 (%s) — 이후 이 모델은 건너뜀", m)
+                        break
                     if not _is_rate_limit(text) or _is_daily_limit(text) or limit_tries >= 4:
+                        log.error("AI 호출 실패 (%s, 논문 %s 외 %d건): %s",
+                                  m, batch[0].source_id, len(batch) - 1, text[:500])
                         raise
                     limit_tries += 1
-                    time.sleep(_retry_delay(text))
+                    delay = _retry_delay(text)
+                    log.warning("AI 요청 한도 초과 (%s) — %.0f초 후 재시도", m, delay)
+                    time.sleep(delay)
         if round_ == 0 and last_error is not None and _is_unavailable(str(last_error)):
             time.sleep(20)
         else:
@@ -318,9 +351,11 @@ def test_connection(provider: str, model: str, api_key: str, endpoint: str = "",
     try:
         result, used = _summarize_batch(provider, model, api_key, [sample], endpoint, fallback=fallback)
     except Exception as e:  # noqa: BLE001 - 어떤 오류든 화면에 그대로 보여 준다
+        log.exception("연결 테스트 실패 (%s · %s)", provider, model)
         return False, f"연결 실패: {explain_error(e)}"
     title = result.get("1", {}).get("titleKo", "")
     note = "" if used == model else f" — {model}이(가) 붐벼서 {used}(으)로 자동 전환"
+    log.info("연결 테스트 성공 (%s · %s → %s)", provider, model, used)
     return True, f"연결 성공 ({used}{note}). 예시 번역: {title}"
 
 
@@ -347,6 +382,8 @@ def summarize(articles: list[Article], provider: str, model: str, api_key: str,
                     by_id, used = fut.result()
                     used_models.add(used)
                 except Exception as e:  # noqa: BLE001 - 한 묶음 실패가 전체를 멈추지 않게
+                    log.error("번역 묶음 실패 (논문 %s 외 %d건)", batch[0].source_id, len(batch) - 1,
+                              exc_info=(type(e), e, e.__traceback__))
                     errors.append(f"{batch[0].source_id} 외 {len(batch) - 1}건: {explain_error(e)}")
                     by_id = {}
                 _apply(batch, by_id)
@@ -354,14 +391,22 @@ def summarize(articles: list[Article], provider: str, model: str, api_key: str,
                 if progress:
                     progress(min(done, total), total)
 
+    log.info("AI %s 시작: %s · %s · %d건", MODES.get(mode, mode), provider, model, total)
+    started = time.monotonic()
     run([articles[i:i + size] for i in range(0, total, size)], 0)
     retry = [a for a in articles if problem(a, mode)]
     if retry:
+        log.warning("결과 검사에 걸린 %d건 다시 요청: %s", len(retry),
+                    ", ".join(f"{a.source_id}({problem(a, mode)})" for a in retry))
         run([retry[i:i + 2] for i in range(0, len(retry), 2)], total)
     still = [a for a in articles if problem(a, mode)]
     if still:
         errors.append("다시 요청해도 번역이 불완전한 논문 (원문 초록 시트와 대조 필요): " +
                       ", ".join(f"{a.source_id}({problem(a, mode)})" for a in still))
+    log.info("AI %s 완료: %.0f초, 사용 모델 %s, 오류 %d건", MODES.get(mode, mode),
+             time.monotonic() - started, sorted(used_models), len(errors))
+    for e in errors:
+        log.warning("확인 필요: %s", e)
     return errors, sorted(used_models)
 
 

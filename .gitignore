@@ -4,3 +4,4 @@ settings.json
 __pycache__/
 시험결과/
 *.xlsx
+logs/

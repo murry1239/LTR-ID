@@ -1,17 +1,16 @@
-"""국회도서관(dl.nanet.go.kr) — 검색결과 파일(‘전체자료 내보내기’ .xls) 불러오기.
+"""국회도서관(dl.nanet.go.kr) 연속간행물·학술기사 검색 — 브라우저 자동 조작.
 
-국회도서관은 프로그램의 직접 검색 요청을 막고 있어, 사용자가 사이트에서 검색한 뒤
-‘전체자료 내보내기’로 받은 파일을 올리면 문검기가 정리한다.
-결과 파일에는 제어번호·자료명·발행자·발행년만 있으므로, 같은 논문을 제목으로
-RISS → PubMed 순서로 찾아 저자·학술지·권호·초록을 채운다 (국회도서관에는 자동 접속하지 않음).
+국회도서관은 검색 화면을 거치지 않은 직접 요청에는 결과를 주지 않으므로,
+PC에 설치된 Microsoft Edge(없으면 Chrome)를 Playwright로 띄워 사람이 하는 순서대로 검색한다.
+  홈 → 검색어 입력 → [연속간행물·학술기사 > 전체] → 발행연도 범위 → 한 쪽 50건씩 넘기며 목록 수집
+  → 각 논문의 ‘초록’ 버튼과 같은 기능으로 초록 수집
+영문 제목은 PubMed에서 같은 논문을 찾아 저자 약어·학술지 약어·출판 월을 보완한다.
 """
-import io
 import re
-from concurrent.futures import ThreadPoolExecutor
+import time
 
 import requests
 
-from . import riss
 from .enrich import pubmed_by_title
 from .log import get_logger
 from .models import MONTHS, Article
@@ -20,117 +19,210 @@ log = get_logger()
 
 NAME = "국회도서관"
 FILE_TAG = "NAL"
-UPLOAD = True  # 화면에서 검색어 대신 결과 파일을 올린다
-FIRST_QUERY_LABEL = "한글 검색어"
+FIRST_QUERY_LABEL = "한글 검색어 (제품명·성분명)"
 SECOND_QUERY_LABEL = "영문 검색어 (선택)"
+NOTE = ("국회도서관은 PC의 Edge(또는 Chrome) 브라우저를 화면 없이 자동으로 조작해 검색합니다. "
+        "목록·초록을 차례로 불러오므로 100건에 2~3분 걸립니다.")
+HOME = "https://dl.nanet.go.kr/"
 DETAIL_URL = "https://dl.nanet.go.kr/search/searchInnerDetail.do?controlNo={}"
-WORKERS = 4
+PAGE_SIZE = 50          # 국회도서관 화면에서 고를 수 있는 최대값
+PAUSE = 0.6             # 요청 사이 쉬는 시간(초) — 사이트에 부담을 주지 않도록
+NAV_TIMEOUT = 60_000
 MONTH_ABBR = {v: k for k, v in MONTHS.items()}
+KINDS = {"KINX": "국내기사", "FINX": "국외기사", "SERL": "학술지·잡지"}
 
-GUIDE = """**국회도서관 검색결과 파일 받는 방법**
-1. [국회도서관 dl.nanet.go.kr](https://dl.nanet.go.kr) → **고급검색** → **상세검색** → **연속간행물·학술기사** → **‘전체’**
-2. 검색분류 **‘전체항목’**에 검색어 입력, **발행연도** 범위 지정 → 검색
-3. 결과 화면에서 **‘전체자료 내보내기’** → 받은 `.xls` 파일을 아래에 올리기
-4. 영문 검색어도 같은 방법으로 받아 두 번째 칸에 올리기 (선택)"""
+# 결과 화면에서 다른 쪽으로 이동 (사이트 자체 함수 changeHanjaYnByList 등과 같은 방식)
+_GO_PAGE_JS = """([n, size]) => {
+    $("#searchMehtod").val("F");
+    $("#zone").val(zone); $("#topMainMenuCode").val(topMainMenuCode); $("#topSubMenuCode").val(topSubMenuCode);
+    $("#pageNum").val(n); $("#pageSize").val(size); $("#orderBy").val(orderBy); $("#hanjaYn").val(hanjaYn);
+    $("#fieldText").val(fieldText); $("#dpBranch").val(dpBranch); $("#journalKind").val(journalKind);
+    searchInnerList(null, ddcPopSearchYn);
+}"""
+
+# 결과 목록에서 논문 정보 읽기
+_PARSE_JS = """() => [...document.querySelectorAll('input.chk[name=chk]')].map(cb => {
+    let li = cb.closest('li');
+    const a = li.querySelector('.top a');
+    const authors = a && a.querySelector('span') ? a.querySelector('span').innerText.trim() : '';
+    let title = a ? a.innerText.trim() : '';
+    if (authors && title.endsWith(authors)) title = title.slice(0, -authors.length).trim();
+    const info = {};
+    li.querySelectorAll('.middle li').forEach(x => {
+        const label = x.querySelector('span') ? x.querySelector('span').innerText.replace(':', '').trim() : '';
+        info[label] = x.innerText.replace(/^[^:]*:/, '').trim();
+    });
+    const links = [...li.querySelectorAll('button.outside-doc, a.outside-doc')].map(b => {
+        const m = (b.getAttribute('onclick') || '').match(/window\\.open\\('([^']+)'/);
+        return m ? m[1] : '';
+    }).filter(Boolean);
+    return {control_no: cb.value, kind: (li.querySelector('.top .btn') || {}).innerText || '',
+            title, authors, journal_info: info['수록정보'] || '', publish: info['발행사항'] || '',
+            has_abs: !!li.querySelector('[onclick*="viewAbs"]'), links};
+})"""
+
+_ABS_JS = """async (controlNo) => {
+    try {
+        const d = await $.ajax({type: 'POST', url: '/search/getFileinfoContents.do',
+                                data: {controlNo: controlNo, fileType: 'ABS'}, dataType: 'json'});
+        return d ? String(d) : '';
+    } catch (e) { return ''; }
+}"""
 
 
-def read_export(data: bytes, filename: str = "") -> list[dict]:
-    """‘전체자료 내보내기’ 파일 → [{control_no, title, publisher, year, kind}]"""
-    rows = []
-    if filename.lower().endswith(".xlsx"):
-        import openpyxl
-        ws = openpyxl.load_workbook(io.BytesIO(data), read_only=True).active
-        values = [[("" if v is None else str(v)) for v in r] for r in ws.iter_rows(values_only=True)]
+def build_query(terms, year_from, year_to) -> str:
+    return " OR ".join(f"[전체항목] {t}" for t in terms) + f" · 연속간행물·학술기사 전체 · 발행연도 {year_from}–{year_to}"
+
+
+def _clean(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _plain_abstract(text: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", text or "", flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    lines = [" ".join(line.split()) for line in text.split("\n")]
+    return "\n".join(line for line in lines if line)
+
+
+def _parse_journal_info(info: str) -> dict:
+    """'Diabetes & metabolism journal = dmj. v.47 n.5 (Sep. 2023), p. 668-681'
+       '대한내과학회지. 제98권 제3호 (2023년 6월), pp. 101-110' → 학술지·권·호·월·쪽"""
+    journal = re.split(r"\.\s*(?:v\.|제\s*\d+\s*권|vol\.|n\.|no\.)", info, maxsplit=1, flags=re.I)[0]
+    journal = re.split(r"\s+=\s+", journal)[0].strip(" .")
+    vol = re.search(r"\b(?:v|vol)\.\s*([\w\-]+)", info, re.I) or re.search(r"제\s*(\d+)\s*권", info)
+    no = re.search(r"\b(?:n|no)\.\s*([\w\-]+)", info, re.I) or re.search(r"제\s*(\d+)\s*호", info)
+    month = None
+    m = re.search(r"\(([A-Z][a-z]{2})\.?\s*(?:\d{1,2},?\s*)?(\d{4})\)", info)
+    if m and m.group(1) in MONTHS:
+        month = MONTHS[m.group(1)]
     else:
-        import xlrd
-        sh = xlrd.open_workbook(file_contents=data).sheet_by_index(0)
-        values = [[str(v) for v in sh.row_values(i)] for i in range(sh.nrows)]
-    if not values:
-        return rows
-    header = [h.strip() for h in values[0]]
-
-    def col(name):
-        return next((i for i, h in enumerate(header) if name in h), None)
-    i_id, i_title, i_pub, i_year = col("제어번호"), col("자료명"), col("발행자"), col("발행년")
-    if i_id is None or i_title is None:
-        raise ValueError("국회도서관 ‘전체자료 내보내기’ 파일이 아닙니다 (제어번호·자료명 열이 없음).")
-    for r in values[1:]:
-        if not r[i_id].strip():
-            continue
-        year = re.search(r"(19|20)\d{2}", r[i_year] if i_year is not None else "")
-        control = r[i_id].strip()
-        rows.append({
-            "control_no": control,
-            "title": " ".join(re.sub(r"\s*/\s*[^=]*$", "", r[i_title]).split()) if " / " in r[i_title]
-            else " ".join(r[i_title].split()),
-            "publisher": r[i_pub].strip() if i_pub is not None else "",
-            "year": int(year.group(0)) if year else None,
-            "kind": {"KINX": "국내기사", "FINX": "국외기사", "SERL": "학술지·잡지"}.get(control[:4], ""),
-        })
-    return rows
+        m = re.search(r"(\d{4})\s*년\s*(\d{1,2})\s*월", info) or re.search(r"\((\d{4})\.\s*(\d{1,2})\)", info)
+        if m:
+            month = int(m.group(2))
+    pages = re.search(r"(?<![A-Za-z])pp?\.\s*(\d[\w]*(?:\s*-\s*\w+)?)", info)  # 'Sep.'의 p. 와 구분
+    return {"journal": journal, "volume": vol.group(1) if vol else "", "issue": no.group(1) if no else "",
+            "month": month if month and 1 <= month <= 12 else None,
+            "pages": pages.group(1).replace(" ", "") if pages else ""}
 
 
-def _match(row: dict, session: requests.Session) -> Article:
-    """RISS → PubMed 순서로 같은 논문을 찾아 정보를 채운다."""
-    note, art = "", None
-    if row["kind"] != "학술지·잡지":
+def _year(publish: str, info: str):
+    m = re.search(r"((?:19|20)\d{2})\.\s*\d{1,2}\.", publish) or re.search(r"((?:19|20)\d{2})", publish + " " + info)
+    return int(m.group(1)) if m else None
+
+
+def _first_author_list(authors: str) -> list[str]:
+    return [a.strip() for a in re.split(r"\s*[,;]\s*", authors or "") if a.strip()]
+
+
+def _build(row: dict, session: requests.Session) -> Article:
+    info = _parse_journal_info(row["journal_info"])
+    year = _year(row["publish"], row["journal_info"])
+    kind = KINDS.get(row["control_no"][:4], _clean(row["kind"]))
+    authors = _first_author_list(row["authors"])
+    journal, vol, no, pages, month = info["journal"], info["volume"], info["issue"], info["pages"], info["month"]
+    abstract = row.get("abstract", "")
+    note = f"{kind} · 국회도서관 초록" if abstract else f"{kind}"
+
+    # 영문 제목이면 PubMed에서 같은 논문을 찾아 저자 약어·학술지 약어·월 보완
+    pm = pubmed_by_title(row["title"], year, session) if kind != "학술지·잡지" else {}
+    if pm:
+        authors = pm["authors"] or authors
+        journal = pm["journal"] or journal
+        vol, no, pages = pm["volume"] or vol, pm["issue"] or no, pm["pages"] or pages
+        if pm.get("month") and pm.get("year") in (year, None):
+            month = pm["month"]
+        if not abstract and pm.get("abstract"):
+            abstract = pm["abstract"]
+            note = f"{kind} · 초록: PubMed"
+        note += f" · 서지 보완: PubMed {pm['pmid']}"
+    if row["links"]:
+        note += " · 외부기관 원문: " + row["links"][0]
+
+    bib = f"{year or ''}{' ' + MONTH_ABBR[month] if month else ''}"
+    if vol:
+        bib += f";{vol}{f'({no})' if no else ''}"
+    if pages:
+        bib += f":{pages}"
+    return Article(
+        source=NAME, source_id=row["control_no"], title=_clean(row["title"]), authors=authors,
+        journal=journal, bib=(bib + ".") if bib else "", year=year, month=month,
+        doi=(pm or {}).get("doi", ""), abstract=abstract, url=DETAIL_URL.format(row["control_no"]),
+        extra={"note": note, "kind": kind, "journal_info": row["journal_info"]},
+    )
+
+
+def _launch(playwright):
+    """PC에 설치된 Edge → Chrome 순서로 사용 (브라우저를 따로 받지 않음)."""
+    last = None
+    for channel in ("msedge", "chrome"):
         try:
-            art = riss.find_by_title(row["title"], row["year"], session)
-            if art:
-                note = "초록·서지: RISS에서 확인"
-        except requests.RequestException as e:
-            log.warning("RISS 제목 대조 실패 (%s): %s", row["control_no"], e)
-        if art is None or not art.has_abstract:
-            pm = pubmed_by_title(row["title"], row["year"], session)
-            if pm:
-                if art is None:
-                    month = pm.get("month")
-                    bib = f"{pm.get('year') or row['year']}{' ' + MONTH_ABBR[month] if month else ''}"
-                    if pm.get("volume"):
-                        bib += f";{pm['volume']}{'(' + pm['issue'] + ')' if pm.get('issue') else ''}"
-                    if pm.get("pages"):
-                        bib += f":{pm['pages']}"
-                    art = Article(source=NAME, source_id=row["control_no"], title=row["title"],
-                                  authors=pm["authors"], journal=pm["journal"], bib=bib + ".",
-                                  year=pm.get("year") or row["year"], month=month, doi=pm["doi"],
-                                  abstract=pm["abstract"], url=f"https://pubmed.ncbi.nlm.nih.gov/{pm['pmid']}/")
-                    art.source = "PubMed"
-                    note = "초록·서지: PubMed에서 확인"
-                elif pm.get("abstract"):
-                    art.abstract = pm["abstract"]
-                    note = "서지: RISS, 초록: PubMed에서 확인"
-    if art is None:
-        art = Article(source=NAME, source_id=row["control_no"], title=row["title"], authors=[],
-                      journal=row["publisher"], bib=f"{row['year']}." if row["year"] else "", year=row["year"])
-        note = ("학술지 단위 자료 (개별 논문 아님)" if row["kind"] == "학술지·잡지"
-                else "RISS·PubMed에서 같은 논문을 찾지 못함 — 국회도서관 원문 확인 필요")
-    # 국회도서관 기준 정보로 맞추기 (제어번호·제목·링크)
-    other_url = art.url if art.source != NAME else ""
-    art.source, art.source_id, art.title = NAME, row["control_no"], row["title"]
-    art.url = DETAIL_URL.format(row["control_no"])
-    if row["year"] and art.year != row["year"]:
-        note += f" (발행년: 국회도서관 {row['year']} / 대조 자료 {art.year})"
-        art.year = row["year"]
-    art.extra.update({"note": note, "kind": row["kind"], "matched_url": other_url, "publisher": row["publisher"]})
-    return art
+            return playwright.chromium.launch(channel=channel, headless=True)
+        except Exception as e:  # noqa: BLE001
+            last = e
+    raise RuntimeError(f"Edge 또는 Chrome 브라우저를 찾지 못했습니다: {last}")
 
 
-def load(data: bytes, filename: str, year_from: int, year_to: int, progress=None) -> tuple[str, list[Article]]:
-    """결과 파일을 읽고 대조·보완한 논문 목록을 돌려준다."""
-    rows = read_export(data, filename)
-    in_range = [r for r in rows if r["year"] is None or year_from <= r["year"] <= year_to]
-    if len(in_range) < len(rows):
-        log.info("[국회도서관] 발행연도 %d–%d 밖 %d건 제외", year_from, year_to, len(rows) - len(in_range))
+def _search_term(page, term: str, year_from: int, year_to: int) -> list[dict]:
+    page.goto(HOME, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+    box = page.locator("input[type=search][placeholder*='검색어']").first
+    box.fill(term)
+    with page.expect_navigation(timeout=NAV_TIMEOUT, wait_until="domcontentloaded"):
+        box.press("Enter")
+    time.sleep(PAUSE)
+    with page.expect_navigation(timeout=NAV_TIMEOUT, wait_until="domcontentloaded"):  # 연속간행물·학술기사 > 전체
+        page.evaluate("changeDbDiv('KINX_ALL', 'KINX_ALL')")
+    time.sleep(PAUSE)
+    with page.expect_navigation(timeout=NAV_TIMEOUT, wait_until="domcontentloaded"):  # 발행연도 범위
+        page.evaluate(f"$('#startPubYear').val('{year_from}'); $('#endPubYear').val('{year_to}'); changePubYear();")
+    time.sleep(PAUSE)
+    page.wait_for_function("typeof totalSizeByMenu !== 'undefined'", timeout=NAV_TIMEOUT)
+    total = int(page.evaluate("totalSizeByMenu") or 0)
+    log.info("[국회도서관] '%s' 연속간행물·학술기사 %d–%d: %d건", term, year_from, year_to, total)
+    rows: dict[str, dict] = {}
+    for n in range(1, -(-total // PAGE_SIZE) + 1):
+        with page.expect_navigation(timeout=NAV_TIMEOUT, wait_until="domcontentloaded"):
+            page.evaluate(_GO_PAGE_JS, [n, PAGE_SIZE])
+        time.sleep(PAUSE)
+        page.wait_for_function("typeof totalSizeByMenu !== 'undefined'", timeout=NAV_TIMEOUT)
+        for r in page.evaluate(_PARSE_JS):
+            rows.setdefault(r["control_no"], r)
+    if len(rows) < total:
+        log.warning("[국회도서관] '%s' 목록 일부만 수집: %d/%d", term, len(rows), total)
+    for r in rows.values():
+        r["abstract"] = _plain_abstract(page.evaluate(_ABS_JS, r["control_no"])) if r["has_abs"] else ""
+        time.sleep(PAUSE / 3)
+    return list(rows.values())
+
+
+def search(terms: list[str], year_from: int, year_to: int, progress=None) -> tuple[str, list[Article]]:
+    from playwright.sync_api import sync_playwright
+    rows: dict[str, dict] = {}
+    with sync_playwright() as p:
+        browser = _launch(p)
+        try:
+            page = browser.new_context(locale="ko-KR").new_page()
+            for i, term in enumerate(terms, 1):
+                for attempt in range(3):  # 사이트가 느리거나 일시적으로 응답이 없으면 처음부터 다시
+                    try:
+                        found = _search_term(page, term, year_from, year_to)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        if attempt == 2:
+                            raise RuntimeError(f"국회도서관 검색 실패 ('{term}'): {e}") from e
+                        log.warning("[국회도서관] '%s' 검색 재시도 (%d/3): %s", term, attempt + 1, str(e)[:200])
+                        time.sleep(3)
+                for r in found:
+                    rows.setdefault(r["control_no"], r)
+                if progress:  # 1단계: 검색어별 목록·초록 수집
+                    progress(i, len(terms))
+        finally:
+            browser.close()
     articles = []
-    with requests.Session() as session, ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        session.headers.update(riss.HEADERS)
-        for n, art in enumerate(pool.map(lambda r: _match(r, session), in_range), 1):
-            articles.append(art)
-            if progress:  # 화면 갱신은 메인 스레드에서만
-                progress(n, len(in_range))
-    found = sum(not a.extra["note"].startswith(("RISS·PubMed에서", "학술지 단위")) for a in articles)
-    log.info("[국회도서관] %s: %d건 중 %d건 대조 성공, 초록 %d건", filename, len(articles), found,
-             sum(a.has_abstract for a in articles))
-    desc = (f"국회도서관 연속간행물·학술기사 검색결과 파일 ‘{filename}’ {len(rows)}건"
-            f"{f' (발행연도 범위 밖 {len(rows) - len(in_range)}건 제외)' if len(in_range) < len(rows) else ''}")
-    return desc, articles
+    with requests.Session() as session:
+        for n, r in enumerate(rows.values(), 1):
+            articles.append(_build(r, session))
+            if progress:  # 2단계: PubMed로 서지 보완
+                progress(n, len(rows))
+    log.info("[국회도서관] %s → %d건, 초록 %d건", terms, len(articles), sum(a.has_abstract for a in articles))
+    return build_query(terms, year_from, year_to), articles

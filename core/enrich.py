@@ -159,12 +159,13 @@ def pubmed_by_title(title: str, year: int | None, session: requests.Session, min
     eng = english_part(title)
     if not eng:
         return {}
-    words = re.sub(r"[^\w\s\-]", " ", eng).split()[:15]
-    term = " ".join(words) + "[ti]" if words else ""
-    if not term:
+    # 불용어(to, of, and …)나 짧은 단어는 [ti] 검색에서 ‘찾을 수 없음’이 되므로 4글자 이상 단어 8개만 쓴다
+    words = [w for w in re.sub(r"[^\w\s]", " ", eng).split() if len(w) >= 4 and w.isalnum()][:8]
+    if len(words) < 2:
         return {}
+    term = " AND ".join(w + "[ti]" for w in words)
     if year:
-        term = f"({' AND '.join(w + '[ti]' for w in words)}) AND {year - 1}:{year + 1}[dp]"
+        term = f"({term}) AND {year - 1}:{year + 1}[dp]"
     try:
         ids = _ncbi_get(session, f"{EUTILS}/esearch.fcgi", {
             "db": "pubmed", "retmode": "json", "retmax": 5, "tool": TOOL, "term": term,

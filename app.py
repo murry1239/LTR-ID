@@ -25,7 +25,7 @@ SOURCES = {
 }
 MANUAL = summarizer.MANUAL_PROVIDER
 CUSTOM_MODEL = "✏️ 직접 입력"
-APP_VERSION = "0.5"
+APP_VERSION = "0.6"
 LOG_HINT = "\n\n🧾 자세한 내용은 왼쪽 아래 ‘로그 보기’에서 확인하세요."
 
 st.set_page_config(page_title="문검기", page_icon="📚", layout="wide")
@@ -256,56 +256,31 @@ def _search_inputs(key: str, module):
     return jobs, year_from, year_to, clicked
 
 
-def _upload_inputs(key: str, module):
-    """결과 파일 올리기 화면 (국회도서관처럼 직접 검색이 막힌 사이트)."""
-    st.markdown(module.GUIDE)
-    this_year = date.today().year
-    slots = []
-    for col, label, n, example in zip(st.columns(2), (module.FIRST_QUERY_LABEL, module.SECOND_QUERY_LABEL),
-                                      ("1", "2"), ("메트포르민", "metformin")):
-        with col:
-            name = st.text_input(f"{label} (파일명에 사용)", key=f"{key}uname{n}", placeholder=f"예: {example}")
-            file = st.file_uploader(f"{label} 검색결과 파일 (.xls)", type=["xls", "xlsx"], key=f"{key}file{n}")
-            slots.append((name.strip(), file))
-    y1, y2, _ = st.columns([1, 1, 4])
-    year_from = int(y1.number_input("시작연도", 1950, this_year, 2021, key=key + "y1"))
-    year_to = int(y2.number_input("종료연도", 1950, this_year + 1, this_year, key=key + "y2"))
-    st.caption("파일의 논문을 제목으로 RISS·PubMed에서 찾아 저자·학술지·초록을 채웁니다 (100건에 1~2분).")
-    clicked = st.button("📥 불러와서 정리", key=key + "search", type="primary")
-    jobs = []
-    for name, file in slots:
-        if file is None:
-            continue
-        data, filename = file.getvalue(), file.name
-        jobs.append(([name or Path(filename).stem],
-                     lambda progress, d=data, f=filename: module.load(d, f, year_from, year_to, progress=progress)))
-    return jobs, year_from, year_to, clicked
-
-
 def source_tab(site: str, module, opts: dict):
     key = f"{site}_"
-    upload = getattr(module, "UPLOAD", False)
-    st.subheader(f"{site} {'검색결과 정리' if upload else '검색'}")
-    jobs, year_from, year_to, clicked = (_upload_inputs if upload else _search_inputs)(key, module)
+    st.subheader(f"{site} 검색")
+    if getattr(module, "NOTE", ""):
+        st.caption(module.NOTE)
+    jobs, year_from, year_to, clicked = _search_inputs(key, module)
 
     if clicked:
         if not jobs:
-            st.warning("검색결과 파일을 올리세요." if upload else "검색어를 입력하세요.")
+            st.warning("검색어를 입력하세요.")
         elif year_from > year_to:
             st.warning("시작연도가 종료연도보다 늦습니다.")
         else:
             groups, pool = [], {}
             for terms, run in jobs:
-                label = f"[{', '.join(terms)}] {'정리' if upload else '검색'} 중"
+                label = f"[{', '.join(terms)}] 검색 중"
                 bar = st.progress(0.0, text=label + "...")
-                log.info("[%s] %s 시작: %s, %d–%d", site, "파일 정리" if upload else "검색", terms, year_from, year_to)
+                log.info("[%s] 검색 시작: %s, %d–%d", site, terms, year_from, year_to)
                 started = time.monotonic()
                 try:
                     query, found = run(lambda d, t, lb=label: bar.progress(min(d / max(t, 1), 1.0), text=f"{lb} {d}/{t}"))
                 except Exception as e:  # noqa: BLE001
                     bar.empty()
                     log.exception("[%s] 실패: %s", site, terms)
-                    st.error(f"{'파일 정리' if upload else '검색'} 중 오류가 발생했습니다: {type(e).__name__} {e}{LOG_HINT}")
+                    st.error(f"검색 중 오류가 발생했습니다: {type(e).__name__} {e}{LOG_HINT}")
                     return
                 bar.empty()
                 log.info("[%s] 완료: %s → %d건 (%.0f초) · %s", site, terms, len(found),

@@ -7,3 +7,4 @@ anthropic
 openai
 google-genai
 xlrd
+playwright

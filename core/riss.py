@@ -204,29 +204,3 @@ def search(terms: list[str], year_from: int, year_to: int, progress=None) -> tup
     articles = [_build(it, d, meta.get(doi, {})) for it, d, doi in zip(items_list, details, dois)]
     return build_query(terms, year_from, year_to), articles
 
-
-def find_by_title(title: str, year: int | None, session: requests.Session, min_score: float = 0.88):
-    """다른 사이트(국회도서관 등)의 논문 제목으로 RISS에서 같은 논문을 찾는다. 없으면 None.
-
-    '한글 제목 = English title' 처럼 병기된 경우 각 부분으로 검색해 본다.
-    """
-    from .enrich import title_similarity
-    parts = [p.strip() for p in re.split(r"\s+=\s+", title or "") if p.strip()] or [title]
-    y1, y2 = (year - 1, year + 1) if year else (1900, 2100)
-    for part in parts:
-        words = re.sub(r"[^\w\s\-]", " ", part).split()[:12]
-        if len(words) < 2:
-            continue
-        res = session.get(SEARCH_URL, params=_params(" ".join(words), y1, y2, 1), timeout=TIMEOUT)
-        res.raise_for_status()
-        _, items = _parse_list(res.text)  # 첫 쪽(최대 100건)만 비교
-        scored = sorted(((title_similarity(title, it["title"]), it) for it in items), key=lambda x: -x[0])
-        if scored and scored[0][0] >= min_score:
-            item = scored[0][1]
-            detail = _detail(item, session)
-            doi = clean_doi(detail["fields"].get("DOI식별코드", ""))
-            meta = pubmed_by_doi([doi], session).get(doi, {}) if doi else {}
-            if doi and not meta:
-                meta = crossref_by_doi(doi, session)
-            return _build(item, detail, meta)
-    return None

@@ -1,4 +1,4 @@
-# 문검기 (문헌검색기) v0.7
+# 문검기 (문헌검색기) v0.8
 
 검색어와 검색기간을 입력 → 검색 결과 확인 → AI 한글 번역 → 엑셀 저장.
 
@@ -43,7 +43,7 @@
 
 ## 사용 순서
 1. 왼쪽 **설정**에서 AI 작업·AI·API 키·번역 모델·저장 폴더 입력 — 입력하면 자동 저장, **연결 테스트**로 확인
-2. 사이트 탭(KoreaMed · RISS · 국회도서관)에서 검색어·시작연도·종료연도 입력 → **검색**
+2. 사이트 탭(KoreaMed · RISS · 국회도서관 · PubMed)에서 검색어·시작연도·종료연도 입력 → **검색**
    - 동의어는 쉼표로 구분 (예: `thioctic acid, lipoic acid, alpha-lipoic acid`) → OR 검색
 3. 결과 표 확인 후 **엑셀 만들기**
    - 파일명: `검색어명(시작-종료)_사이트_검색일자.xlsx` (예: `pioglitazone(2021-2026)_Koreamed_20261026.xlsx`)
@@ -54,6 +54,7 @@
 |---|---|---|
 | KoreaMed | `검색어[ALL] AND 시작:종료[DPY]` | 출판 월·학술지 약어 포함 |
 | 국회도서관 | 고급검색 → 상세검색 → **연속간행물·학술기사 [전체]**, 검색분류 **[전체항목]**, 발행연도 범위 | **한글 + 영문 검색어** → 검색어별 엑셀. PC의 Edge(또는 Chrome)를 화면 없이 자동 조작 (100건에 2~3분) |
+| PubMed | 고급검색 **[All Fields]** 검색어 AND **[Date - Publication]** 시작일~종료일 AND (선택) **Free Full Text** | 날짜는 년/월/일로 입력. Free Full Text는 기본으로 켜져 있음. 파일명 `검색어(YY.MM.DD-YY.MM.DD)_Pubmed_YYMMDD_건수.xlsx` |
 | RISS | 상세검색 → **국내학술논문**, 분류 **[전체]**, 발행연도 범위 | **한글 검색어 + 영문 검색어**를 함께 넣으면 한 번에 검색하고 엑셀은 검색어별로 따로 저장 (예: `피오글리타존(2021-2026)_RISS_…xlsx`, `pioglitazone(2021-2026)_RISS_…xlsx`). 0건이어도 검색 조건을 기록한 파일을 만듭니다. |
 
 - RISS 목록에는 출판 월·쪽수·DOI가 없어 상세 페이지에서 저자·쪽수·DOI를 가져오고,
@@ -69,6 +70,14 @@
 - 영문 논문은 PubMed에서 같은 논문을 찾아 저자 약어·학술지 약어·출판 월을 맞춥니다 (`Scherbak NN, et al. Diabetes Metab J. 2023 Sep;47(5):668-681.`).
 - 엑셀 **비고** 칸: 자료 종류(국내기사/국외기사/학술지·잡지), 초록 출처, PubMed 번호, 외부기관 원문(KCI 등) 링크.
 - 시험 결과(2021–2026): glimepiride 5건(초록 5건), 글리메피리드 0건, Thioctic acid 8건, 티옥트산·치옥트산 0건 — Codex 수작업 결과와 같음.
+
+### PubMed
+- NCBI 공식 E-utilities로 검색합니다 (무료, 키 불필요). 고급검색에서 [All Fields]를 고르면 필드 태그 없이 검색되는 방식을 그대로 따릅니다.
+  예: `(Vitamin B-complex with Vitamin C) AND ("2022/03/23"[Date - Publication] : "2026/09/23"[Date - Publication]) AND "free full text"[Filter]`
+- 서지정보는 PubMed 표기대로 일(日)까지: `Tang H, et al. BMC Nephrol. 2026 Sep 18;27(1):597.`
+- 초록이 없는 논문은 ‘초록 확인 안됨’. StatPearls 같은 책 장(Book chapter)도 서지 형식에 맞춰 정리합니다.
+- 엑셀 비고 칸에 PMC 무료 원문 링크가 적힙니다.
+- 시험: Vitamin B-complex with Vitamin C, 2022/03/23–2026/09/23, Free Full Text → 150건 (초록 147·없음 3) — Codex 결과와 같음.
 
 ## 무료 Gemini 사용 한도
 - 무료 키는 **모델마다 하루 약 20회** 요청 한도가 있습니다 (한 번에 논문 10건 → 모델당 하루 약 200건).
@@ -90,11 +99,14 @@
 - `core/models.py` 공통 논문 형식 · `core/excel.py` 엑셀 · `core/summarizer.py` AI 번역·요약
 - `core/koreamed.py` KoreaMed 검색, `core/riss.py` RISS 검색, `core/nanet.py` 국회도서관 검색(브라우저 자동 조작),
   `core/enrich.py` DOI·제목으로 서지정보 보완(PubMed·Crossref), `core/log.py` 작업 기록
-- 국회도서관·PubMed도 같은 형태(`search()`, `NAME`, `FILE_TAG`, 선택: `SECOND_QUERY_LABEL`)로 추가 후
+- `core/pubmed.py` PubMed 검색(E-utilities)
+- 새 사이트도 같은 형태(`search()`, `NAME`, `FILE_TAG`, 선택: `SECOND_QUERY_LABEL`)로 추가 후
   `app.py`의 `SOURCES`에 등록하면 탭이 활성화됩니다.
 - `settings.json`(API 키 포함)은 이 PC에만 저장되며 깃허브에 올라가지 않습니다 (`.gitignore`).
 
 ## 변경 이력
+- **v0.8** — PubMed 검색 추가 (All Fields 검색어, 발행일 년/월/일 범위, Free Full Text 기본 적용, 책 장 포함),
+  PubMed 파일명 `검색어(YY.MM.DD-YY.MM.DD)_Pubmed_검색일자_건수.xlsx`, 4개 사이트 모두 사용 가능
 - **v0.7** — 엑셀 저장 오류 수정: 초록에 섞인 제어 문자(눈에 안 보이는 특수 문자)를 지우고 저장 (국회도서관 amoxicillin 사례),
   파일 하나가 실패해도 나머지는 저장하고 오류는 짧게 표시, 같은 검색을 다시 저장하면 `_2` 대신 덮어쓰기,
   과부하(503) 모델은 5분 동안 뒤로 미뤄 번역 시간 단축, 엑셀 비고에 번역한 AI 모델 표시,

@@ -11,6 +11,8 @@ from openpyxl.utils import get_column_letter
 
 from .models import Article
 
+NO_ABSTRACT = "초록 확인 안됨"
+
 FONT = "Malgun Gothic"
 NAVY = "214E76"
 HEADER_FILL = PatternFill("solid", fgColor=NAVY)
@@ -102,7 +104,8 @@ def write_workbook(path: Path, articles: list[Article], *, search_name: str, sit
     _header(ws, head, titles, widths)
     for n, a in enumerate(articles, 1):
         r = head + n
-        values = [n, a.year, a.month, a.title, a.title_ko, a.citation, a.abstract_ko, a.study_type,
+        abstract_ko = a.abstract_ko or ("" if a.has_abstract else NO_ABSTRACT)  # 번역을 안 해도 초록 없음은 표시
+        values = [n, a.year, a.month, a.title, a.title_ko, a.citation, abstract_ko, a.study_type,
                   a.doi, a.source_id, site, remark(a)]
         for col, v in enumerate(values, 1):
             cell = _put(ws, r, col, v)

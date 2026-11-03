@@ -11,7 +11,7 @@ import streamlit as st
 
 import time
 
-from core import excel, koreamed, nanet, riss, settings, summarizer
+from core import excel, koreamed, nanet, pubmed, riss, settings, summarizer
 from core.log import LOG_DIR, get_logger, tail
 
 log = get_logger()
@@ -21,11 +21,11 @@ SOURCES = {
     "KoreaMed": koreamed,
     "RISS": riss,
     "국회도서관": nanet,
-    "PubMed": None,
+    "PubMed": pubmed,
 }
 MANUAL = summarizer.MANUAL_PROVIDER
 CUSTOM_MODEL = "✏️ 직접 입력"
-APP_VERSION = "0.7"
+APP_VERSION = "0.8"
 LOG_HINT = "\n\n🧾 자세한 내용은 왼쪽 아래 ‘로그 보기’에서 확인하세요."
 
 st.set_page_config(page_title="문검기", page_icon="📚", layout="wide")
@@ -236,11 +236,25 @@ def _show_group(site: str, group: dict, articles: list, shown_mode):
     show_table(results_table(articles, shown_mode), site)
 
 
+def _parse_date(text: str):
+    """'2022/03/23', '2022-03-23', '2022.3.23', '20220323' → date (틀리면 None)."""
+    import re
+    digits = re.findall(r"\d+", text or "")
+    if len(digits) == 1 and len(digits[0]) == 8:
+        digits = [digits[0][:4], digits[0][4:6], digits[0][6:]]
+    try:
+        return date(int(digits[0]), int(digits[1]), int(digits[2])) if len(digits) == 3 else None
+    except ValueError:
+        return None
+
+
 def _search_inputs(key: str, module):
     """검색어 입력 화면 → (실행할 작업 목록, 시작연도, 종료연도, 버튼 눌림)."""
     second_label = getattr(module, "SECOND_QUERY_LABEL", None)
     first_label = getattr(module, "FIRST_QUERY_LABEL", "검색어 (제품명·성분명)")
-    cols = st.columns([3, 3, 1, 1]) if second_label else st.columns([3, 1, 1])
+    date_range = getattr(module, "DATE_RANGE", False)
+    cols = (st.columns([3, 3, 1, 1]) if second_label else
+            st.columns([3, 1.2, 1.2]) if date_range else st.columns([3, 1, 1]))
     terms_text = cols[0].text_input(
         first_label, key=key + "terms",
         placeholder=("예: 피오글리타존  ·  동의어는 쉼표로: 티옥트산, 치옥트산" if second_label else
@@ -248,14 +262,37 @@ def _search_inputs(key: str, module):
     second_text = cols[1].text_input(second_label, key=key + "terms2",
                                      placeholder="예: pioglitazone") if second_label else ""
     this_year = date.today().year
-    year_from = int(cols[-2].number_input("시작연도", 1950, this_year, 2021, key=key + "y1"))
-    year_to = int(cols[-1].number_input("종료연도", 1950, this_year + 1, this_year, key=key + "y2"))
+    extra = {}
+    if date_range:  # PubMed: 발행일(년/월/일) 범위 — 2022/03/23 처럼 글자로 입력
+        lo_text = cols[-2].text_input("시작일 (YYYY/MM/DD)", f"{this_year - 5}/01/01", key=key + "d1")
+        hi_text = cols[-1].text_input("종료일 (YYYY/MM/DD)", f"{date.today():%Y/%m/%d}", key=key + "d2")
+        lo, hi = _parse_date(lo_text), _parse_date(hi_text)
+        if lo is None or hi is None:
+            st.warning("날짜는 2022/03/23 처럼 입력하세요.")
+            lo, hi = lo or date(this_year - 5, 1, 1), hi or date.today()
+        year_from, year_to = lo.year, hi.year
+        extra = {"date_from": lo, "date_to": hi}
+    else:
+        year_from = int(cols[-2].number_input("시작연도", 1950, this_year, 2021, key=key + "y1"))
+        year_to = int(cols[-1].number_input("종료연도", 1950, this_year + 1, this_year, key=key + "y2"))
+        lo, hi = year_from, year_to
+    options = {k: st.checkbox(label, value=default, key=f"{key}opt_{k}")
+               for k, (label, default) in getattr(module, "OPTIONS", {}).items()}
     if second_label:
         st.caption("한글 검색어와 영문 검색어를 함께 넣으면 한 번에 검색하고, 엑셀은 검색어별로 따로 만듭니다.")
     clicked = st.button("🔍 검색", key=key + "search", type="primary")
-    jobs = [(terms, lambda progress, t=terms: module.search(t, year_from, year_to, progress=progress))
+    jobs = [(terms, lambda progress, t=terms: module.search(t, lo, hi, progress=progress, **options))
             for terms in (_split_terms(terms_text), _split_terms(second_text)) if terms]
-    return jobs, year_from, year_to, clicked
+    if lo > hi:
+        year_from, year_to = year_to + 1, year_to  # 아래에서 ‘시작이 종료보다 늦음’으로 걸러지도록
+    return jobs, year_from, year_to, clicked, extra
+
+
+def _filename(module, name: str, result: dict, count: int) -> str:
+    """사이트별 파일명. PubMed는 [검색어(YY.MM.DD-YY.MM.DD)_Pubmed_YYMMDD_건수] 형식."""
+    if hasattr(module, "make_filename"):
+        return module.make_filename(name, result["date_from"], result["date_to"], result["today"], count)
+    return excel.make_filename(name, result["year_from"], result["year_to"], module.FILE_TAG, result["today"])
 
 
 def source_tab(site: str, module, opts: dict):
@@ -263,13 +300,13 @@ def source_tab(site: str, module, opts: dict):
     st.subheader(f"{site} 검색")
     if getattr(module, "NOTE", ""):
         st.caption(module.NOTE)
-    jobs, year_from, year_to, clicked = _search_inputs(key, module)
+    jobs, year_from, year_to, clicked, extra = _search_inputs(key, module)
 
     if clicked:
         if not jobs:
             st.warning("검색어를 입력하세요.")
         elif year_from > year_to:
-            st.warning("시작연도가 종료연도보다 늦습니다.")
+            st.warning("시작이 종료보다 늦습니다.")
         else:
             groups, pool = [], {}
             for terms, run in jobs:
@@ -293,7 +330,7 @@ def source_tab(site: str, module, opts: dict):
             st.session_state[key + "result"] = {
                 "groups": groups, "pool": pool, "articles": list(pool.values()),
                 "year_from": year_from, "year_to": year_to,
-                "today": date.today(), "ai_mode": None, "saved": [],
+                "today": date.today(), "ai_mode": None, "saved": [], **extra,
             }
 
     result = st.session_state.get(key + "result")
@@ -324,7 +361,7 @@ def source_tab(site: str, module, opts: dict):
         name = st.text_input(f"파일명에 쓸 검색어명 ({', '.join(group['terms'])})", value=group["terms"][0],
                              key=f"{key}name_{i}") or group["terms"][0]
         names.append(name)
-        filename = excel.make_filename(name, result["year_from"], result["year_to"], module.FILE_TAG, result["today"])
+        filename = _filename(module, name, result, len(group["ids"]))
         st.caption(f"저장 위치: {folder / filename}")
     if use_ai and manual and not manual_ready:
         st.caption("※ 복사·붙여넣기를 다 마치지 않고 저장하면, 남은 논문의 한글 칸은 비어 있습니다.")
@@ -361,8 +398,7 @@ def source_tab(site: str, module, opts: dict):
         saved, failed = [], []
         written = result.setdefault("written", {})  # 이번 검색에서 이미 만든 파일은 _2를 만들지 않고 덮어쓴다
         for group, name in zip(result["groups"], names):
-            filename = excel.make_filename(name, result["year_from"], result["year_to"],
-                                           module.FILE_TAG, result["today"])
+            filename = _filename(module, name, result, len(group["ids"]))
             target = str(folder / filename)
             path = Path(written[target]) if target in written else excel.unique_path(folder, filename)
             try:

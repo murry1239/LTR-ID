@@ -5,6 +5,7 @@ from datetime import date
 from pathlib import Path
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -15,6 +16,19 @@ NAVY = "214E76"
 HEADER_FILL = PatternFill("solid", fgColor=NAVY)
 THIN = Side(style="thin", color="CBD5E1")
 WRAP_TOP = Alignment(wrap_text=True, vertical="top")
+CELL_LIMIT = 32_000  # 엑셀 한 칸 최대 글자 수(32,767) 안쪽
+
+
+def safe(value):
+    """엑셀에 쓸 수 없는 제어 문자(눈에 안 보이는 특수 문자)를 지우고, 너무 긴 글은 자른다."""
+    if not isinstance(value, str):
+        return value
+    value = ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value if len(value) <= CELL_LIMIT else value[:CELL_LIMIT] + " …(이하 생략)"
+
+
+def _put(ws, row, col, value):
+    return ws.cell(row=row, column=col, value=safe(value))
 
 
 def make_filename(name: str, year_from: int, year_to: int, file_tag: str, today: date) -> str:
@@ -38,7 +52,7 @@ def sort_articles(articles: list[Article]) -> list[Article]:
 
 def _header(ws, row, titles, widths):
     for col, (title, width) in enumerate(zip(titles, widths), 1):
-        cell = ws.cell(row=row, column=col, value=title)
+        cell = _put(ws, row, col, title)
         cell.font = Font(name=FONT, bold=True, color="FFFFFF", size=10)
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -49,6 +63,14 @@ def _body_cell(cell):
     cell.font = Font(name=FONT, size=10)
     cell.alignment = WRAP_TOP
     cell.border = Border(bottom=THIN)
+
+
+def remark(a: Article) -> str:
+    """비고: 자료 출처·대조 링크·번역한 AI 모델."""
+    parts = [a.extra.get("note", ""), a.extra.get("matched_url", "")]
+    if a.extra.get("ai_model"):
+        parts.append(f"번역: {a.extra['ai_model']}")
+    return " · ".join(x for x in parts if x)
 
 
 def write_workbook(path: Path, articles: list[Article], *, search_name: str, site: str, query: str,
@@ -70,7 +92,7 @@ def write_workbook(path: Path, articles: list[Article], *, search_name: str, sit
         (ai_note, None),
     ]
     for i, (text, font) in enumerate(info, 1):
-        cell = ws.cell(row=i, column=1, value=text)
+        cell = _put(ws, i, 1, text)
         cell.font = font or Font(name=FONT, size=10, color="475569")
 
     titles = ["번호", "출판연도", "출판월", "논문명 (원문)", "논문명 (한글)", "서지정보",
@@ -81,10 +103,9 @@ def write_workbook(path: Path, articles: list[Article], *, search_name: str, sit
     for n, a in enumerate(articles, 1):
         r = head + n
         values = [n, a.year, a.month, a.title, a.title_ko, a.citation, a.abstract_ko, a.study_type,
-                  a.doi, a.source_id, site,
-                  " ".join(x for x in (a.extra.get("note", ""), a.extra.get("matched_url", "")) if x)]
+                  a.doi, a.source_id, site, remark(a)]
         for col, v in enumerate(values, 1):
-            cell = ws.cell(row=r, column=col, value=v)
+            cell = _put(ws, r, col, v)
             _body_cell(cell)
         for col in (1, 2, 3, 10):
             ws.cell(row=r, column=col).alignment = Alignment(horizontal="center", vertical="top")
@@ -104,7 +125,7 @@ def write_workbook(path: Path, articles: list[Article], *, search_name: str, sit
     for n, a in enumerate(articles, 1):
         values = [n, a.source_id, a.title, ", ".join(a.authors), a.citation, a.abstract or "(초록 없음)", a.keywords]
         for col, v in enumerate(values, 1):
-            _body_cell(ws2.cell(row=n + 1, column=col, value=v))
+            _body_cell(_put(ws2, n + 1, col, v))
     ws2.freeze_panes = "C2"
 
     path.parent.mkdir(parents=True, exist_ok=True)

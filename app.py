@@ -25,7 +25,7 @@ SOURCES = {
 }
 MANUAL = summarizer.MANUAL_PROVIDER
 CUSTOM_MODEL = "✏️ 직접 입력"
-APP_VERSION = "0.6"
+APP_VERSION = "0.7"
 LOG_HINT = "\n\n🧾 자세한 내용은 왼쪽 아래 ‘로그 보기’에서 확인하세요."
 
 st.set_page_config(page_title="문검기", page_icon="📚", layout="wide")
@@ -95,6 +95,8 @@ def sidebar() -> dict:
         "AI 선택", names, index=names.index(cfg["provider"]) if cfg["provider"] in names else 0,
         format_func=summarizer.label, help="🆓 무료 2가지, 💳 유료 API 3가지 (ChatGPT·Claude·Gemini)",
         key="cfg_provider", on_change=_autosave("cfg_provider", lambda c, v: c.update(provider=v)))
+    st.sidebar.caption("ChatGPT·Claude·Gemini 모두 쓸 수 있습니다: 💳 유료 API(각 회사 API 키 필요) 또는 "
+                       "🆓 웹 채팅 복사·붙여넣기(무료 채팅 화면 사용).")
 
     opts = {"provider": provider, "mode": mode, "model": "", "api_key": "", "endpoint": "", "chat": "",
             "fallback": True}
@@ -356,28 +358,35 @@ def source_tab(site: str, module, opts: dict):
             header = summarizer.ABSTRACT_HEADERS[result["ai_mode"]]
         else:
             ai_note, header = "AI 번역 없음 (원문만 수록).", summarizer.ABSTRACT_HEADERS[mode]
-        saved = []
+        saved, failed = [], []
+        written = result.setdefault("written", {})  # 이번 검색에서 이미 만든 파일은 _2를 만들지 않고 덮어쓴다
         for group, name in zip(result["groups"], names):
             filename = excel.make_filename(name, result["year_from"], result["year_to"],
                                            module.FILE_TAG, result["today"])
+            target = str(folder / filename)
+            path = Path(written[target]) if target in written else excel.unique_path(folder, filename)
             try:
-                saved.append(str(excel.write_workbook(
-                    excel.unique_path(folder, filename), [pool[i] for i in group["ids"]],
+                excel.write_workbook(
+                    path, [pool[i] for i in group["ids"]],
                     search_name=name, site=site, query=group["query"],
                     year_from=result["year_from"], year_to=result["year_to"], today=result["today"],
-                    ai_note=f"[문검기 v{APP_VERSION}] {ai_note}", abstract_header=header)))
-            except PermissionError:
-                log.exception("엑셀 저장 실패 (파일이 열려 있거나 권한 없음): %s", folder / filename)
-                st.error(f"{filename} 파일을 저장할 수 없습니다. 같은 이름의 엑셀 파일이 열려 있으면 닫고 다시 시도하세요.")
-                return
+                    ai_note=f"[문검기 v{APP_VERSION}] {ai_note}", abstract_header=header)
+            except PermissionError:  # 한 파일이 실패해도 나머지 파일은 저장
+                log.exception("엑셀 저장 실패 (파일이 열려 있거나 권한 없음): %s", path)
+                failed.append(f"{path.name}: 같은 이름의 엑셀 파일이 열려 있어 저장할 수 없습니다. 엑셀에서 닫고 다시 누르세요.")
+                continue
             except Exception as e:  # noqa: BLE001
-                log.exception("엑셀 저장 실패: %s", folder / filename)
-                st.error(f"{filename} 저장 중 오류: {type(e).__name__} {e}{LOG_HINT}")
-                return
-            log.info("[%s] 엑셀 저장: %s (%d건)", site, saved[-1], len(group["ids"]))
-        result["saved"] = saved
+                log.exception("엑셀 저장 실패: %s", path)
+                failed.append(f"{path.name}: {type(e).__name__} — {str(e)[:120]}…")
+                continue
+            written[target] = str(path)
+            saved.append(str(path))
+            log.info("[%s] 엑셀 저장: %s (%d건)", site, path, len(group["ids"]))
+        result["saved"], result["failed"] = saved, failed
         st.rerun()
 
+    if result.get("failed"):
+        st.error("일부 파일을 저장하지 못했습니다:\n\n" + "\n".join(f"- {f}" for f in result["failed"]) + LOG_HINT)
     for n, saved in enumerate(result.get("saved") or []):
         path = Path(saved)
         st.success(f"저장 완료: {path}")

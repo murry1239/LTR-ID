@@ -19,7 +19,7 @@ NO_ABSTRACT = "초록 확인 안됨"
 FREE_PROVIDER = "Gemini (Google) - 무료"
 PAID_GEMINI = "Gemini (Google) - 유료"
 MANUAL_PROVIDER = "웹 채팅 복사·붙여넣기 (ChatGPT·Copilot·Gemini 무료)"
-MANUAL_LABEL = "🆓 무료 · 웹 채팅 복사·붙여넣기 (ChatGPT·Gemini·Copilot)"
+MANUAL_LABEL = "🆓 무료 · 웹 채팅 복사·붙여넣기 (ChatGPT·Claude·Gemini·Copilot)"
 
 # 키(이름)는 settings.json에 저장되므로 바꾸지 말 것. 화면에는 label을 보여 준다.
 # family: 호출 방식 / batch: 한 번에 보낼 논문 수 / workers: 동시 요청 수 / interval: 요청 사이 최소 간격(초)
@@ -265,6 +265,16 @@ def _is_exhausted(model: str) -> bool:
         return at is not None and time.time() - at < 3 * 3600
 
 
+_busy: dict[str, float] = {}  # 과부하(503) 모델 → 마지막 실패 시각
+BUSY_MINUTES = 5
+
+
+def _is_busy(model: str) -> bool:
+    with _exhausted_lock:
+        at = _busy.get(model)
+        return at is not None and time.time() - at < BUSY_MINUTES * 60
+
+
 def _is_daily_quota(text: str) -> bool:
     """무료 티어 하루 요청 한도 초과 (결제 잔액 부족과는 구분)."""
     low = text.lower()
@@ -275,6 +285,8 @@ def _summarize_batch(provider, model, api_key, batch, endpoint, mode=TRANSLATE, 
     """(논문 ID별 결과, 실제로 쓴 모델)을 돌려준다."""
     call = CALLERS[PROVIDERS[provider]["family"]]
     models = [m for m in _models_to_try(provider, model, fallback) if not _is_exhausted(m)]
+    # 방금 503(과부하)을 낸 모델은 몇 분 동안 뒤로 미뤄, 묶음마다 다시 시도하느라 시간을 버리지 않는다
+    models = [m for m in models if not _is_busy(m)] + [m for m in models if _is_busy(m)]
     if not models:
         raise SummaryError("429 RESOURCE_EXHAUSTED — 시도할 수 있는 모든 모델이 오늘 무료 한도(requests per day)를 다 썼습니다.")
     last_error = None
@@ -296,7 +308,10 @@ def _summarize_batch(provider, model, api_key, batch, endpoint, mode=TRANSLATE, 
                     text = str(e)
                     last_error = e
                     if _is_unavailable(text):
-                        log.warning("AI 모델 사용 불가 (%s) — 다음 모델로 전환: %s", m, text[:300])
+                        with _exhausted_lock:
+                            _busy[m] = time.time()
+                        log.warning("AI 모델 사용 불가 (%s) — %d분 동안 뒤로 미루고 다음 모델로 전환: %s",
+                                    m, BUSY_MINUTES, text[:300])
                         break  # 다음 모델로
                     if _is_daily_quota(text):  # 모델마다 하루 한도가 따로 있으므로 다음 모델로
                         with _exhausted_lock:
@@ -386,7 +401,7 @@ def summarize(articles: list[Article], provider: str, model: str, api_key: str,
                               exc_info=(type(e), e, e.__traceback__))
                     errors.append(f"{batch[0].source_id} 외 {len(batch) - 1}건: {explain_error(e)}")
                     by_id = {}
-                _apply(batch, by_id)
+                _apply(batch, by_id, used if by_id else "")
                 done += len(batch)
                 if progress:
                     progress(min(done, total), total)
@@ -426,11 +441,13 @@ def problem(a: Article, mode: str = TRANSLATE) -> str:
     return ""
 
 
-def _apply(batch: list[Article], by_id: dict) -> int:
-    """AI 결과를 논문에 채우고, 채운 건수를 돌려준다."""
+def _apply(batch: list[Article], by_id: dict, model: str = "") -> int:
+    """AI 결과를 논문에 채우고, 채운 건수를 돌려준다. model은 엑셀 비고에 ‘번역: 모델’로 남긴다."""
     filled = 0
     for a in batch:
         r = by_id.get(a.source_id)
+        if r and model:
+            a.extra["ai_model"] = model
         if r:
             a.title_ko = (r.get("titleKo") or "").strip()
             a.study_type = (r.get("studyType") or "").strip()
@@ -447,6 +464,7 @@ def _apply(batch: list[Article], by_id: dict) -> int:
 # 채팅 입력창 한 번에 넣을 수 있는 글자 수 (여유를 두고 잡은 값)
 CHAT_LIMITS = {
     "ChatGPT (chatgpt.com)": 30000,
+    "Claude (claude.ai)": 30000,
     "Gemini (gemini.google.com)": 30000,
     "Copilot - 회사 계정 (M365 Copilot Chat)": 14000,
     "Copilot - 개인 계정 (copilot.microsoft.com)": 3800,
@@ -478,6 +496,6 @@ def apply_manual_answer(batch: list[Article], answer: str) -> tuple[int, list[st
     """웹 채팅 답변(JSON)을 반영한다. (채운 건수, 빠진 논문 ID 목록)"""
     results = _parse(answer)
     by_id = {str(r.get("id")): r for r in results}
-    filled = _apply(batch, by_id)
+    filled = _apply(batch, by_id, "웹 채팅")
     missing = [a.source_id for a in batch if a.source_id not in by_id]
     return filled, missing

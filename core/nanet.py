@@ -79,7 +79,8 @@ def _clean(text: str) -> str:
 
 
 def _plain_abstract(text: str) -> str:
-    text = re.sub(r"<br\s*/?>", "\n", text or "", flags=re.I)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", text or "")  # 눈에 안 보이는 제어 문자
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     lines = [" ".join(line.split()) for line in text.split("\n")]
     return "\n".join(line for line in lines if line)
